@@ -1,0 +1,11 @@
+# ffmpeg — 上游裸 CLI 的树包形态（D12 agent-CLI 口味，与 git/codex/
+# grok 同族：PATH 面 CLI，不注册 aginx 命令面，无守护进程）。
+# 源= johnvansickle 7.0.2 arm64 全静态（musl/glibc 通吃），
+# ffmpeg+ffprobe 双件；2026-10-28 redfin 烟测：抽帧/转码(x264+aac)/
+# ffprobe 探测全绿（收据 RECEIPT-exam §14）。
+name = "ffmpeg"
+version = "7.0.2"
+summary = "ffmpeg 7.0.2 全静态双件（ffmpeg+ffprobe）：抽帧/转码/媒体探测腿，PATH 面 CLI 无守护"
+group = "dev"
+url = "https://pkgs.aginx.net/ffmpeg/v7.0.2/ffmpeg-v7.0.2-4pc.tar"
+exec = "bin/ffmpeg"
