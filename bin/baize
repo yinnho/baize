@@ -1,0 +1,15 @@
+#!/bin/sh
+# baize:summary=白泽面：唯一裸命令，派发 baize-* 各腿（D13 三代版：姓=baize）
+# baize:args=<腿> [args…]（day/night/harvest/adopt/k）
+# baize:examples=baize day / baize k rulings / baize k verify
+# baize:group=core
+set -eu
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+case "${1:-}" in
+  ""|-h|--help)
+    echo "usage: baize <day|night|harvest|adopt|k> [args…]" ;;
+  day|night|harvest|adopt|k)
+    exec "$ROOT/bin/baize-$@" ;;
+  *)
+    echo "baize: 未知腿 $1" >&2; exit 2 ;;
+esac

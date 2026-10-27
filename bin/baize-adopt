@@ -51,5 +51,5 @@ for f in "$SRC"/*.md; do
     mv "$tmp" "$ROOT/.local/adopt-rejects/$b"; rej=$((rej+1)); REJ="$REJ $b"
   fi
 done
-"$ROOT/bin/k" roster
+"$ROOT/bin/baize-k" roster
 echo "baize-adopt: 认领 $ok 件，拒 $rej 件${REJ:+ →$REJ}（.local/adopt-rejects/）"

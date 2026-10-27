@@ -70,8 +70,8 @@ done
 [ -n "$ADDED" ] || fail "引擎零产出（engine.log 见上）"
 ADDED=$(echo "$ADDED" | sed 's/,$//;s/^ //')
 
-# 名册=派生物，从正典重建（单一出处=bin/k roster）
-"$ROOT/bin/k" roster
+# 名册=派生物，从正典重建（单一出处=bin/baize-k roster）
+"$ROOT/bin/baize-k" roster
 
 # 版本账（append-only）
 printf '{"ts":"%s","day":"%s","engine":"%s","added":[%s]}\n' \
