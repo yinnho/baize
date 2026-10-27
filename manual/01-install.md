@@ -74,10 +74,12 @@ shasum -a 256 rootfs-v0.0.2-redfin.img      # raw: bec8479f…
 
 ## 8. 出生礼（seed → home，只落空家）
 
-- baize 包（心跳腿 + seed）【待落 · v0.0.x 上架】；装法同上 opt-in。
+- baize 包（心跳腿 + seed）= v0.0.3（baize v0.1.0），装法同上 opt-in；
+  显式路径收装【待落 manifest 复钉】。
 - 落座条件门：`/home` 无人格树才铺 seed；**已有记忆的机器永不重置**
   （多白泽铁律：一台设备一个人，各长各的）。
 - 旧身体搬家才用 `baize adopt` 认祖归宗——一次性血缘继承，不是同步。
+  （redfin 首考钦定走此路：**记忆要存在**——见附录 A 换壳节。）
 - 验收：`baize day --stub` 绿；次晨版本账有新条目。
 
 ## 9. 收尾
@@ -94,6 +96,21 @@ shasum -a 256 rootfs-v0.0.2-redfin.img      # raw: bec8479f…
 - 烤：`DEVICE=<codename> ./scripts/build-rootfs.sh` → 按
   `rootfs-v<版>-<codename>` 发 release。
 - **先在废机上考**，再上生产机。
+
+### 旧身体换壳（同机刷机保记忆）
+
+刷机抹 `/home`，但**这台机器的人不跟着死**（钦定 2026-10-27：
+redfin 记忆要存在）：
+
+1. **刷前导出**（设备在线时）：整树打包 `/home`（人格+workflows+
+   记忆），旧记忆库若有 kv/库先导出成 `knowledge/*.md`（db 要
+   db+wal+shm 三件一起拉）。导出件存别处（Mac/新家之外），秘密
+   不在导出件里（§9 律）。
+2. 刷 v0.0.2+ → §5–§7 → opt-in baize → 出生礼（空家，新身体）。
+3. **认祖归宗**：`baize adopt <导出的knowledge目录>`——旧正典
+   归一化认领进新家，一次性血缘；过不了三关的进 rejects 报告，
+   不静默丢。
+4. 验收：名册里既有出厂四件、也有认领来的旧件（血缘可见）。
 
 ## 附录 B：已知设备雷区（踩过才写下的）
 
