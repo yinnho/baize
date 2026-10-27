@@ -15,8 +15,8 @@
 # （AGENTS.md + 四件通用正典 + 空名册）并接 23:47 心跳。已有记忆的
 # 机器（家中有 AGENTS.md）永不触碰。
 name = "baize"
-version = "0.1.0"
-summary = "白泽心跳与出厂底模：五腿 + seed（空家自动出生礼）"
+version = "0.1.1"
+summary = "白泽心跳与出厂底模：五腿 + seed（空家自动出生礼；adopt 设备律重写）"
 group = "core"
-url = "https://pkgs.aginx.net/baize/v0.1.0/baize-v0.1.0-4pc.tar"
+url = "https://pkgs.aginx.net/baize/v0.1.1/baize-v0.1.1-4pc.tar"
 exec = "bin/baize"

@@ -1,12 +1,15 @@
 #!/bin/sh
 # baize:summary=认祖归宗：归一化导入旧身体的正典件（旧记忆认领进本尊）
 # baize:args=<srcdir>（旧正典 *.md 所在目录）
-# baize:examples=baize-adopt .local/redfin-import/knowledge
+# baize:examples=baize-adopt /tmp/knowledge-import
 # baize:group=memory
-# 归一化（只动结构不动语义）：补 description=正文首行截80；ruling 的
-# 「**场景**：/**裁决**：」改写为「## 场景/## 钦定」；补 origin 与缺省
-# date（取 mtime）；原 source/confidence/尾部溯源行原样保留。过不了
-# 三关的进 rejects 报告，不静默丢。
+# 归一化（只动结构不动语义）：补 description=正文首行截60字（jq 按码点
+# 截，UTF-8 安全）；ruling 的「**场景**：/**裁决**：」改写为
+# 「## 场景/## 钦定」；补 origin 与缺省 date（取 mtime）；原
+# source/confidence/尾部溯源行原样保留。过不了三关的进 rejects 报告，
+# 不静默丢。
+# 设备律（redfin #538）：busybox awk 必 segfault、perl 不在——本腿只用
+# sh/sed(简单构造)/grep/jq；jq=白泽闭包在编件。
 set -eu
 B=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
 ROOT=$(cd "$B/.." && pwd)
@@ -16,28 +19,57 @@ else echo "baize-adopt: 需要 BAIZE_HOME（安装正典 §8）" >&2; exit 2; fi
 K="$H/knowledge"; mkdir -p "$K"
 SRC=${1:?usage: baize-adopt <srcdir>}
 
+strip_head() { # 剥正文首行的装饰头（场景/裁决/井号/破折号）
+  sed 's/^\*\*场景\*\*[:：]*//' | sed 's/^\*\*裁决\*\*[:：]*//' \
+    | sed 's/^## *//' | sed 's/^[-*# >]*//'
+}
+
 norm() { # norm <in> <out> <origin> <date>
-  first=$(awk 'c==2 && NF {print; exit} /^---$/{c++}' "$1")
-  [ -n "$first" ] || first=$1
-  first=$(printf '%s' "$first" | sed 's/^\*\*场景\*\*：*//; s/^\*\*裁决\*\*：*//; s/^[-*# >]*//')
-  desc=$(printf '%s' "$first" | perl -CSD -ne 'chomp; print substr($_, 0, 60)')
-  awk -v desc="$desc" -v org="$3" -v dt="$4" '
-    NR==1 { fm = ($0 == "---") ? 1 : 0 }
-    fm==1 && !closed && NR>1 && $0=="---" {
-      if (!hasdesc) print "description: " desc
-      print "origin: " org
-      if (!hasdate) print "date: " dt
-      print "---"; closed=1; next
-    }
-    fm==1 && !closed {
-      if ($0 ~ /^description:/) hasdesc=1
-      if ($0 ~ /^date:/) hasdate=1
-      print; next
-    }
-    /\*\*场景\*\*/ { sub(/\*\*场景\*\*[:：]*/, "## 场景") }
-    /\*\*裁决\*\*/ { sub(/\*\*裁决\*\*[:：]*/, "## 钦定") }
-    { print }
-  ' "$1" > "$2"
+  rw=$(mktemp); mid=$(mktemp)
+  # 全文行内改写（一次一模式，管道不用 -i——#538 复杂构造烧核+双平台）
+  sed 's/\*\*场景\*\*[:：]*/## 场景/g' "$1" > "$rw"
+  sed 's/\*\*裁决\*\*[:：]*/## 钦定/g' "$rw" > "$mid"; mv "$mid" "$rw"
+  if [ "$(head -n1 "$rw")" != "---" ]; then
+    # 无 frontmatter：现造头（name=文件名），正文原样
+    first=$(grep -m1 -v '^[[:space:]]*$' "$rw" || true)
+    [ -n "$first" ] || first="(旧身体正典件，正文无首行)"
+    desc=$(printf '%s\n' "$first" | strip_head | jq -Rr '.[0:60]')
+    {
+      printf -- '---\nname: %s\ndescription: %s\ntype: fact\norigin: %s\ndate: %s\n---\n' \
+        "${1##*/}" "$desc" "$3" "$4"
+      cat "$rw"
+    } > "$2"
+    rm -f "$rw"; return
+  fi
+  # 正文首行：第二道 --- 之后第一个非空行
+  n=$(grep -n '^---$' "$rw" | sed -n 2p | cut -d: -f1)
+  if [ -n "$n" ]; then
+    first=$(tail -n +"$((n+1))" "$rw" | grep -m1 -v '^[[:space:]]*$' || true)
+  else
+    first=""
+  fi
+  [ -n "$first" ] || first="(旧身体正典件，正文无首行)"
+  desc=$(printf '%s\n' "$first" | strip_head | jq -Rr '.[0:60]')
+  # 注入：缺 description 补、origin 恒补、缺 date 补
+  hasdesc=0; hasdate=0; closed=0
+  {
+    printf -- '---\n'   # 开头线在此印，管道从第2行起（闭合线=第二道 ---）
+    tail -n +2 "$rw" | while IFS= read -r line; do
+      if [ "$closed" -eq 0 ] && [ "$line" = "---" ]; then
+        if [ "$hasdesc" -eq 0 ]; then printf 'description: %s\n' "$desc"; fi
+        printf 'origin: %s\n' "$3"
+        if [ "$hasdate" -eq 0 ]; then printf 'date: %s\n' "$4"; fi
+        printf '%s\n' "$line"; closed=1
+        continue
+      fi
+      if [ "$closed" -eq 0 ]; then
+        case "$line" in description:*) hasdesc=1 ;; esac
+        case "$line" in date:*) hasdate=1 ;; esac
+      fi
+      printf '%s\n' "$line"
+    done
+  } > "$2"
+  rm -f "$rw"
 }
 
 ok=0; rej=0; REJ=""
