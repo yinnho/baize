@@ -1,0 +1,139 @@
+# aginx-pkg manifest — the opt-in catalog (L0, 刀4 2026-09-11: every entry
+# opt — provision installs NOTHING by default; what runs on this phone is
+# the user's own opt-in). Format per line: <name> <url> <sha256> [core|opt]
+# — 4th field optional, absent = core. core self-heals via `aginx-pkg
+# sync`; opt is user-picked (`aginx-pkg opt-in`; the bake appends the
+# aginx-family lines below at image assembly, same tier). ('#' comments,
+# blank lines ok)
+#
+# M26: the default manifest is SIGNED — /etc/agpkg.manifest.sig holds a
+# detached ed25519 sig over these raw bytes (same key/chain as aginx-update
+# updates). sync/available/opt-in refuse an unsigned or tampered file;
+# an explicit path argument stays unsigned (adb dev loop). Edit here =>
+# re-sign on the host: aginx-sign sign .local/keys/aginx.key <this file>
+# (scripts/build-rootfs.sh does it automatically when the sig is stale).
+#
+# The sha256 pins content, so transport honesty is not load-bearing — but
+# the canonical source is GitHub releases. On networks where GitHub stalls,
+# prefix the URL with https://gh-proxy.com/ (sha256 still verified).
+#
+# #87 (2026-09-03): the canonical DOWNLOAD source is our own mirror,
+# https://pkgs.aginx.net (nginx on 86quan, /data/pkgs.aginx.net). GitHub
+# releases stay the upstream of record — the mirror is refilled from there
+# by /data/pkgs.aginx.net/sync.sh (socks5 127.0.0.1:8800, sha-gated, retry
+# loop: release-assets' Azure blob throttles bursts with 200+XML bodies).
+# Same files, same sha256 pins — the phone saw GitHub stall dead on this
+# network (bake #10 recovery: 39MB of 64MB then silence), the mirror is
+# domestic and fast. gh-proxy stays the documented emergency fallback.
+#
+# An artifact may be a bare musl binary (v0 path) or a 四件套 tar
+# (bin/<name> + pkg.toml + SKILL.md, required) — aginx-pkg tells them
+# apart by the ustar magic.
+#
+# N4 切净 (2026-09-05): the first-gen `aginx` (relay/gateway daemon) and
+# `aginx-carrier` entries are DELETED — the N4 image carries no carrier
+# daemon and no relay; the remote channel rebuilds as aginx-gateway in N5.
+#
+# 2026-09-26: web tools moved INTO the mother (runtime tools/web/, in-process
+# aginxbrowser client) — the aginx-web CLI package is retired, its line
+# deleted. agf/agmem re-cut under their D13 names as aginx-file/aginx-mem
+# (the mother's bridges spawn `aginx-file|aginx-mem tool <name>`; a device
+# without them loses every file/memory tool — 09-26 晨报 stuck root cause).
+#
+# codex/grok have no usable upstream raw-musl asset (codex ships a tarball,
+# grok has no musl release at all) — mirrored as raw binaries under
+# yinnho/aginxos releases. aginxbrowser's UPSTREAM v0.2.5 musl asset
+# segfaults on device (their CI zig was broken at tag time; fixed in
+# b0315d7 after the tag) — same mirror treatment, device-verified rebuild
+# (M10, /health + /fetch ok). All sha256 match the on-device installs.
+#
+# 2026-09-26: aginxbrowser moved to its own repo (yinnho/aginxbrowser,
+# bare v-tags) and its official musl assets are device-usable since
+# v0.2.11 (V8-snapshot fix). Pinned v0.5.8 screenshot variant — device
+# runs the full engine (#250 viewport + P0 receipts need screenshot);
+# /open route verified in-tree (src/main.rs route table). Screenshot
+# asset filename has NO v-prefix (upstream release quirk). v0.2.5 mirror
+# dir retained on pkgs.aginx.net for rollback re-pin.
+#
+# v0.5.9 (2026-09-26): 模板内置地板——qr/reply/weather 三页 include_str!
+# 编进二进制（src/tmpl.rs BUILTIN），fresh flash 后 /open 全套可用：此前
+# 模板只在设备 scp + 生态仓，刷机即丢。/var/lib/aginxbrowser/templates
+# 仍是热修覆盖层（盘上同名赢内置，scp 秒生效）。本地 arm64 zigbuild
+# 出件（宿主/目标 V8 档分取，gh-proxy 过墙），rust-objcopy --strip-all，
+# sha 即本行；v0.5.8 镜像目录保留可回钉。
+#
+# v0.6.2 (2026-10-24): 官方 release 资产直接吃（#473 正典）——v0.6.0 起
+# deno_core 退役、diting_runtime 自有 JS 运行时全栈；/fetch 带 media
+# 字段 + /download 可选 dir（研究引擎 REQ 两件均落地）。sha256 与 gh api
+# digest 逐字符核过；镜像 /v0.6.2/ 服务器侧复验同值；v0.5.9 目录保留
+# 可回钉。
+
+aginxbrowser   https://pkgs.aginx.net/aginxbrowser/v0.6.2/aginxbrowser-0.6.2-aarch64-unknown-linux-musl-screenshot ef6a18bb7749a25f1e9fdb6a5b19e223242baa3ae35fbe446a3c175e5c1c6e23 opt
+# python3 (M28) — first TREE bundle: musl CPython 3.12.14 (python-build-
+# standalone 20260901 install_only_stripped) + Alpine musl 1.2.5 ld.so;
+# pkg.toml exec faces /var/bin/python3 as a symlink into
+# /var/lib/agpkg/pkgfiles/python3/. Provision finalize links the loader
+# to /lib/ld-musl-aarch64.so.1 (kernel interp path) and marks it done.
+python3        https://pkgs.aginx.net/python3/v3.12.14/python3-v3.12.14-4pc.tar 23923ffe46c3562d3801b742fea02ccc7f0aaddd91d7a40a66e4a6ee7a6beb73 opt
+codex          https://pkgs.aginx.net/codex/v0.151.0/codex-v0.151.0-aarch64-unknown-linux-musl 56f026015ccc3ebc12895282200d89c216892bf6fa15fa7f228e6e0c6ad6ce76 opt
+# M30–M35 tool packages (2026-09-03 推送): the runtime's filesystem and
+# memory bridges spawn these CLIs — core tier, a rootfs without them has
+# an agent that cannot read/remember. (2026-09-26: web line retired —
+# browser/search/fetch now run in-mother; names D13-re-cut below.)
+dup            https://pkgs.aginx.net/dup/v0.2.0/dup-v0.2.0-4pc.tar 652f9d583611826cdb3c5c02ee62a07b3e710df786c914f3a0e2629173c32a82 opt
+aginx-file     https://pkgs.aginx.net/aginx-file/v0.1.0/aginx-file-v0.1.0-4pc.tar f2318f15e2887fb463bc09a7231284583f106b732e7ecc2ca3333bd18099de2c opt
+aginx-mem      https://pkgs.aginx.net/aginx-mem/v0.2.0/aginx-mem-v0.2.0-4pc.tar 203a585b54964ccb160095c2cd16b25a008f9141a06458c3a234661baae5abe4 opt
+# grok is optional since M23 (选装 tier): an agent CLI like codex, but
+# self-built and not needed for the phone's own loop — pick it via "+".
+grok           https://pkgs.aginx.net/grok/v1.0.41/grok-v1.0.41-aarch64-unknown-linux-musl 7c0b8c973af6a78e2037f19ed93033471b8c5e722f9ff04b86b092e066e60d74 opt
+# aginx-proxy (2026-09-26 redfin 首装；2026-10-26 上架)：stunnel client
+# 树包 → 本机 socks5 127.0.0.1:8800，agent 机境外腿（grok/aginxbrowser
+# 穿行）。conf/PSK 不进包——设备侧 /etc/stunnel/ 是真源，缺 conf 启动
+# 即退=预期，先写 conf 再装。
+aginx-proxy    https://pkgs.aginx.net/aginx-proxy/v0.1.1/aginx-proxy-v0.1.1-4pc.tar f4138b25e8daed06acdfd413f6241f03f2db78dedf76ad168248459e5a0872b0 opt 0.1.1
+# git (L0 缺口刀C, 2026-09-12) — Alpine v3.22 aarch64 apk 闭包整树
+# （route D）：git 2.49.1 全功能 + musl 1.2.5 loader + https 传输闭包
+# （libcurl/openssl…，CA 走镜像烤入的 /etc/ssl/certs 绝对路径）。
+# wrapper 面 bin/git 首跑自链 /lib/ld-musl-aarch64.so.1（python3 包同
+# 工艺、自持共存）。配方 pkgs/git/，apk sha256 钉表在 build-pkg.sh
+# git) 分支；PATH 面 CLI（D12 agent-CLI 口味），不注册 aginx 命令面。
+git            https://pkgs.aginx.net/git/v2.49.1/git-v2.49.1-4pc.tar 8a4923db9431664bef22e212e0ed9547a20c94651a37aef082547114b9c93a9f opt
+# aginxresearch/aginx 等 Layer A/B 包不占本清单行——build-rootfs.sh 组装期
+# 从 pkgs/<name>/pkg.toml+出件 sha 自动追加（OPT_ADD 段；手写行会烤出双行，
+# 2026-10-10 清掉曾误入的 aginxresearch 行）。设备侧 opt-in 走烤装清单或
+# 手拼签发件（收据 #478 配方）。
+# sqlite3 (2026-10-10) — 官方 amalgamation zig cc musl 全静态单件
+# （一切皆CLI 裁决：结构化查询工具 CLI 上机；研究库只读查询
+# 'file:...?mode=ro'，WAL 并发读者安全）。PATH 面 CLI（git/codex/
+# grok 同族），不注册 aginx 命令面。zip 尺寸+sha256 钉表在
+# build-pkg.sh sqlite3) 分支，缓存 out/sqlite-cache。
+sqlite3        https://pkgs.aginx.net/sqlite3/v3.54.0/sqlite3-v3.54.0-4pc.tar 1a7bb960270f40530510edb3617c6cbf50f3ee650592ea8679abed96a8939ae8 opt
+# aginx-fg（2026-10-15 首上架 v0.1.2）：qpnp-qg 板用户态电量计——L0 无
+# stock FG daemon 时 msoc 冻结在 PON 值，本包 run 常驻库仑积分+周期写回
+# SYS/CC；v0.1.2 加深放焊 0 证据门自愈（bms<1 且 VBAT≥4.35V 且 Full/Taper）。
+# v0.1.3（10-26 #546）：门拒改常驻等待——旧版拒即 exit 五撞断路器躺死，
+# 充到 Taper/Full 时无人写回。只对有 /dev/qg 的板有用（服务器板勿
+# opt-in）。
+aginx-fg       https://pkgs.aginx.net/aginx-fg/v0.1.3/aginx-fg-v0.1.3-4pc.tar 08cde0c43dfcb9b51a8fd653787c786e980596001574e0103a959aa7e8053b0f opt 0.1.3
+# jq (2026-10-24, dev CLI 补齐四件之二) — Alpine v3.22 aarch64 jq+
+# oniguruma+musl 闭包 3 apk（sha256 钉表在 build-pkg.sh jq) 分支；dl-cdn
+# 当夜不通，源钉 tuna 镜像（apk 文件与 dl-cdn 同源同 sha）。wrapper 面
+# bin/jq 同 git 工艺简化版（loader 自链先到先得）。主用例：JSON 信封
+# 解码（relay 会话 JSONL/ACP 响应、duphub manifest）。PATH 面 CLI
+# （D12 agent-CLI 口味），不注册 aginx 命令面。
+jq             https://pkgs.aginx.net/jq/v1.8.2/jq-v1.8.2-4pc.tar a80611d3f52c8b4b473aa98060fba3bd6367c0cadfcd4b587123077c32ce83dc opt
+# claude (2026-10-24, 引擎商品第三件) — 官方 npm 平台子包
+# claude-code-linux-arm64-musl：Bun 编译原生单文件 270M（自带 runtime
+# 不需要 Node）；MEMBER_MAX 提档 512MiB 随本件（安装器需换代）。引擎
+# 口味（codex/grok 同族）：agents 档案 env 腿，不注册 aginx 命令面。
+# brain 腿=ANTHROPIC_BASE_URL https://brain.aginx.net/anthropic。
+# deps=bash：Bash 工具腿硬找 bash（busybox 无 applet），随闭包带入。
+bash           https://pkgs.aginx.net/bash/v5.2.37/bash-v5.2.37-4pc.tar c7cf6faa6f88895a6b36c50bc82aaf1992a18576d2cf27cff3940a50b3c1d75b opt 5.2.37
+claude         https://pkgs.aginx.net/claude/v2.1.310/claude-v2.1.310-4pc.tar a33643c2b08a8b1bb2513cf88b99213b08b13505ac5df812285aae38ae489bdd opt 2.1.310 bash
+# aginx-boot-ok（2026-10-26 首上架）：A/B 槽 successful 标记器，债 #346
+# 刀——L0 无标记器则 ABL 每靴排水，7 烧尽回退另一槽（#548 实录）。
+# oneshot_async 等 done ok 后写 GPT attrs（Qualcomm r3-0.6 位法）。
+# 无 A/B 的板（X2）不装；redfin 走烤内 rcS 路径不装；enchilada 首用户。
+# v0.1.1：单元 cmd 改 /bin/sh+内嵌等待（v0.1.0 的 wrapper face 旧代
+# 安装器不造 → svcd absent）。
+aginx-boot-ok  https://pkgs.aginx.net/aginx-boot-ok/v0.1.1/aginx-boot-ok-v0.1.1-4pc.tar 62001cb88210d7c716439f84470b1ca646e1f5bff9c5dd3e4e78a8be1dc7b43d opt 0.1.1

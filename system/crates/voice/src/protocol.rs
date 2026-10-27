@@ -1,0 +1,1406 @@
+//! 语音对话协议 v0 — 无 LLM 的确定性状态机（M42a，命令优先重设计 2026-09-06）。
+//!
+//! 产品定义（2026-09-05 终稿）：手机即智能体，人只发指令、机器干活——
+//! 缺参数才问，一次问一个，问完就干。老「扫描→序数→拼密码→回读确认」
+//! 多步流程废弃：连网只剩「说连网」或「对准码」，机器自己走完剩下的一
+//! 切（配对码是超集：WiFi + brain 钥匙 + 网关身份 + relay 密一眼全落）。
+//! 没听懂就说没听懂，不做模糊匹配——这是自举地板：WiFi 必须在 LLM 可用
+//! 之前连得上。
+//!
+//! 纯逻辑、零 I/O：daemon（main.rs）喂 Ev，收 Out；所有副作用（TTS、
+//! 拍照、连接、配对落盘）都是 Out::Act，由 daemon 落地。机器的下一步
+//! 也由协议决定（NetState::NoConf → 直接开眼等码），daemon 只执行。
+
+// ---------------- events / outputs ----------------
+
+/// 网络现状（daemon 查完回喂；连网命令的判定输入）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum NetState {
+    /// wlan0 有 IPv4——什么都不用做
+    Up,
+    /// 有 wifi.conf 但按它连不上（密码换了/AP 没了）——开眼等码
+    ConfFail,
+    /// 没有任何身份记录——开眼等码
+    NoConf,
+}
+
+/// 关机/重启两档（面法B 09-07：两词同一闸，只差落地动作）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerAction {
+    Poweroff,
+    Reboot,
+}
+
+impl PowerAction {
+    pub fn verb(&self) -> &'static str {
+        match self {
+            PowerAction::Poweroff => "关机",
+            PowerAction::Reboot => "重启",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ev {
+    /// 一段 ASR 识别文本（已归一化由本模块完成，原样传入即可）
+    Heard(String),
+    /// daemon 心跳（真实流逝毫秒）。命令优先重写后唯一需要时间的态是
+    /// 口令等待（PowerWait）——安全闸不无界等人，超时作废回 Idle。
+    Tick(u32),
+    /// Act::NetConnect 的判定结果（daemon 查 IP/conf 后回喂）
+    NetState(NetState),
+    /// Act::Join 完成：Ok(ip) / Err(原因)——WIFI: 码路径
+    JoinDone(Result<String, String>),
+    /// Act::PairApply 完成：Ok(报告话) / Err(原因)——配对码路径
+    PairDone(Result<String, String>),
+    /// Act::QrScan 完成：Ok(每码一条 payload) / Err(拍照/解码失败原因)
+    QrDone(Result<Vec<String>, String>),
+    /// Act::Ocr 完成：Ok(每行一条文本) / Err(拍照/识别失败原因)
+    OcrDone(Result<Vec<String>, String>),
+    /// Act::Call 终局（刀5b：daemon 查名录/观测子进程后回喂）
+    CallDone(CallEnd),
+}
+
+/// 通话终局（刀5b，M48 刀5）。话术是地板话——原因细节只进 daemon 日志。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallEnd {
+    /// call.conf 查无此名（名随事件走——协议无驻留态，话术要用）
+    NoNumber { name: String },
+    /// 接通后正常挂断（本端音量键 SIGINT / 对端 BYE 同一形态）
+    Done,
+    /// 没接通（15s 拨号窗尽/对端不可达——窗内建在 aginx-call 的
+    /// call_and_wait，daemon 只按「从未接通」归类）
+    NoAnswer,
+    /// 起不来/接通后桥断（spawn 失败、mic 打不开等）
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Act {
+    /// 连网：daemon 查 IP/wifi.conf 后回 NetState
+    NetConnect,
+    /// 加入网络（WIFI: 码到手，直接连——拉式）
+    Join { ssid: String, psk: String },
+    /// 配对落盘（AGINXPAIR1 码到手：连网 + 身份三件进 env + 服务重启，
+    /// 拉式到手即用，不回读不确认。
+    PairApply { bundle: aginx_qr::PairBundle },
+    /// 打开眼取景（与音量+同一条路；已开则空转）
+    Eye,
+    /// 关闭眼取景（取消语义的落地点；没开则空转）
+    EyeClose,
+    /// 拍照解 QR（cam-shot 盲拍 + aginx-qr，M42b 眼分支）
+    QrScan,
+    /// 取景念字（取景帧 + ag-ocr——音量+才是镜头识别，盲拍 09-10 退役）
+    Ocr,
+    /// 状态查询（时间/电池/网络）——daemon 读系统后经 inject_say 上脸
+    Status,
+    /// 口令验证通过，执行关机/重启（面法B）。协议只说结论话术，断电
+    /// 由 daemon spawn aginx-reboot——不进 Act 的路径一条都没有（fail-closed）。
+    PowerExec { action: PowerAction },
+    /// 自由文本喂母体/新前台（N2②：aginx agent send）。封闭词表全部
+    /// miss 时走这里；前台不可达由 daemon 落回离线地板话。
+    Chat(String),
+    /// 语音直拨（刀5b，M48 刀5 零脑直拨）：确定性机器动作，同 WiFi join
+    /// 先例——daemon 查 call.conf 名录后 spawn aginx-call，不过 brain。
+    Call { target: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Out {
+    /// 机器话语：上屏（对话行）。拉式语音（2026-09-04 用户收据：识别和
+    /// 回应都快、唯独嘴慢）——daemon 对 Say 默认不出声，回应即时上脸；
+    /// 想听再说「你说给我听」。
+    Say(String),
+    /// 点名要听：上屏（若文本还不在屏上，调用方先推行）+ 必 TTS。
+    /// 「念一下」的 OCR 读、「再念一遍」的回读、「你说给我听」的复述。
+    Speak(String),
+    /// 执行动作
+    Act(Act),
+}
+
+// ---------------- state ----------------
+
+/// 口令等待预算（毫秒）：进 PowerWait 起算，三次尝试共享，超时作废。
+/// 与 EYE_VIEW_SECS 同 30s 量级——安全闸不无界等人。
+pub const POWER_WAIT_MS: u32 = 30_000;
+/// 口令连错上限：第三次错即作废回 Idle（防对着机器穷举）。
+pub const POWER_TRIES: u8 = 3;
+
+/// 面法B 唯一驻留态：等口令。命令优先重写（2026-09-06）砍光了所有等待
+/// 态——等码的长等待归眼取景自己的生命周期；但关机/重启的口令闸必须由
+/// 协议持有（tries 计数是安全语义，不能散进 daemon）。
+struct PowerWait {
+    action: PowerAction,
+    tries: u8,
+    waited_ms: u32,
+}
+
+/// 对话机（M42a 命令优先版）。除口令等待外无驻留态：每个指令一步走完，
+/// 等码的长等待由眼取景自己的生命周期管（30s 上限 + 帧自愈），协议
+/// 不再记「现在在第几步」。
+pub struct Vm {
+    /// 对话行（(谁, 文本)），屏显用；cap 8 行滚动
+    lines: Vec<(bool, String)>,
+    /// 自由文本改投新前台（N2②）。false = 老行为（没听懂地板）。
+    /// new() 恒 false——既有测试不动，开前台一律 with_front()。
+    front: bool,
+    /// 面法B 关机/重启口令。None = 未设置 = fail-closed（词收下、闸不开、
+    /// 拒绝执行）。daemon 从 env 读入并 norm 后注入；值永不进日志/脸/报告。
+    power_key: Option<String>,
+    /// 关机/重启口令等待（见 PowerWait）
+    power_wait: Option<PowerWait>,
+}
+
+impl Vm {
+    pub fn new() -> Vm {
+        Vm {
+            lines: Vec::new(),
+            front: false,
+            power_key: None,
+            power_wait: None,
+        }
+    }
+
+    /// 开前台的 Vm：step_idle 的自由文本分支改投 Act::Chat。
+    pub fn with_front() -> Vm {
+        Vm {
+            front: true,
+            ..Vm::new()
+        }
+    }
+
+    /// 注入口令（面法B）。值须已 norm（daemon 侧做——与 Heard 同一归一化，
+    /// 口令怎么说的就怎么比）。None/空 = 未设置。
+    pub fn with_power_key(mut self, key: Option<String>) -> Vm {
+        self.power_key = key.filter(|k| !k.is_empty());
+        self
+    }
+
+    /// V3（09-10）：state 字段随 face 退役——生产无消费者；测试断言
+    /// 驻留态（powerwait 三部曲）仍要读它。
+    #[cfg(test)]
+    pub fn state_name(&self) -> &'static str {
+        if self.power_wait.is_some() {
+            "powerwait"
+        } else {
+            "idle"
+        }
+    }
+
+    /// 屏显对话行：(is_user, text)——面已不序列化 lines（v4 退役），
+    /// 只给协议测试断言用（生产路径走 face::set_line）。
+    #[cfg(test)]
+    pub fn lines(&self) -> &[(bool, String)] {
+        &self.lines
+    }
+
+    /// 状态查询走 Act::Status：daemon 读系统（时间/电池/网络）后用 inject_say
+    /// 把拼好的话送回上面（拉式语音：Say 不出声，SM 纯逻辑，不碰钟）。
+    pub fn inject_say(&mut self, s: &str) -> Out {
+        self.lines.push((false, s.to_string()));
+        self.trim_lines();
+        Out::Say(s.to_string())
+    }
+
+    fn say(&mut self, outs: &mut Vec<Out>, s: &str) {
+        self.lines.push((false, s.to_string()));
+        self.trim_lines();
+        outs.push(Out::Say(s.to_string()));
+    }
+    /// 点名要听的话语：推对话行 + 必出声。
+    fn say_loud(&mut self, outs: &mut Vec<Out>, s: &str) {
+        self.lines.push((false, s.to_string()));
+        self.trim_lines();
+        outs.push(Out::Speak(s.to_string()));
+    }
+    fn heard_line(&mut self, s: &str) {
+        self.lines.push((true, s.to_string()));
+        self.trim_lines();
+    }
+    fn trim_lines(&mut self) {
+        while self.lines.len() > 8 {
+            self.lines.remove(0);
+        }
+    }
+
+    /// 驱动一步。返回要 daemon 落地的输出序列。
+    pub fn step(&mut self, ev: Ev) -> Vec<Out> {
+        let mut outs = Vec::new();
+        match ev {
+            Ev::Heard(raw) => {
+                let text = norm(&raw);
+                if text.is_empty() {
+                    // 空 ASR 不静默：走到这的都是 ≥0.1s 的真尝试（真误触在
+                    // capture_take 已拦）。不吭声=用户以为死了（2026-09-04
+                    // 三连空串实测）。也不进对话行——屏上留空行难看。
+                    self.say(&mut outs, "没听清。请按住键说。");
+                    return outs;
+                }
+                // 取消优先于一切（口令等待一并作废）
+                if is_cancel(&text) {
+                    self.power_wait = None;
+                    self.heard_line(&raw);
+                    self.say(&mut outs, "已取消。");
+                    outs.push(Out::Act(Act::EyeClose));
+                    return outs;
+                }
+                // 点名要听（拉式语音）：复述最近一条机器话语。
+                if is_speak_request(&text) {
+                    self.heard_line(&raw);
+                    match self.lines.iter().rev().find(|(u, _)| !u) {
+                        Some((_, s)) => outs.push(Out::Speak(s.clone())),
+                        None => self.say_loud(&mut outs, "我还没说过话。"),
+                    }
+                    return outs;
+                }
+                // 口令等待中：这一句就是口令尝试。不上对话行（heard_line 不
+                // 走）——口令是秘密，与 psk 同律：脸/日志里只有机器的判定
+                // 话，没有口令原文。
+                if self.power_wait.is_some() {
+                    self.step_power(&text, &mut outs);
+                    return outs;
+                }
+                self.heard_line(&raw);
+                self.step_idle(&text, &mut outs);
+            }
+            Ev::Tick(ms) => {
+                // daemon 心跳。只有 PowerWait 关心时间：超时作废回 Idle。
+                // 空等 = 空返回（零分配，200ms 一拍不带负担）。
+                if let Some(pw) = &mut self.power_wait {
+                    pw.waited_ms = pw.waited_ms.saturating_add(ms);
+                    if pw.waited_ms >= POWER_WAIT_MS {
+                        self.power_wait = None;
+                        self.say(&mut outs, "太久没说口令，已取消。");
+                    }
+                }
+            }
+            Ev::NetState(ns) => match ns {
+                NetState::Up => self.say(&mut outs, "网已连。"),
+                NetState::ConfFail | NetState::NoConf => {
+                    // 机器自己走下一步：不开清单不问人，直接睁眼等码。
+                    // 配对码是超集（连网+身份），WIFI: 码只连网，都是拉式。
+                    self.say(&mut outs, "对准配对码或无线码。");
+                    outs.push(Out::Act(Act::Eye));
+                }
+            },
+            Ev::JoinDone(r) => match r {
+                Ok(ip) => self.say(&mut outs, &format!("连上了，地址{ip}。")),
+                Err(e) => self.say(&mut outs, &format!("没连上，{e}。再说连网重试。")),
+            },
+            Ev::PairDone(r) => match r {
+                Ok(msg) => {
+                    // 脸上留技术细节；收尾句出声（hardline 接回 = 母体
+                    // 重新接通，Matrix 法理即技术真相）。配对成功收镜头
+                    // ——码到手取景的活就干完了（daemon 在 PairApply 臂
+                    // 先收；这里是语义与兜底）。
+                    self.say(&mut outs, &format!("配对完成，{msg}。"));
+                    self.say_loud(&mut outs, "Connection restored. Welcome to the real world.");
+                    outs.push(Out::Act(Act::EyeClose));
+                }
+                Err(e) => self.say(&mut outs, &format!("配对没成，{e}。再说连网重试。")),
+            },
+            Ev::QrDone(r) => {
+                // 拉式：取景器开着就是机器在等码——到手直接用，不问「是
+                // 不是」。配对码是 WiFi 码的超集，先配对后 WiFi；回读确认
+                // 只留给耳朵听来的（噪声通道）。psk 一律不上屏。
+                let pair = match &r {
+                    Ok(payloads) => payloads
+                        .iter()
+                        .find_map(|p| aginx_qr::parse_pair_payload(p)),
+                    Err(_) => None,
+                };
+                let wifi = match &r {
+                    Ok(payloads) => payloads
+                        .iter()
+                        .find_map(|p| aginx_qr::parse_wifi_payload(p)),
+                    Err(_) => None,
+                };
+                match (pair, wifi) {
+                    (Some(bundle), _) => {
+                        let ask = format!(
+                            "扫到{}的配对码，连接配对。",
+                            bundle.ssid
+                        );
+                        self.say(&mut outs, &ask);
+                        outs.push(Out::Act(Act::PairApply { bundle }));
+                    }
+                    (None, Some(w)) => {
+                        let ask = if w.psk.is_empty() {
+                            format!("扫到网络{}，开放网络，连接。", w.ssid)
+                        } else {
+                            format!(
+                                "扫到网络{}，密码{}位，连接。",
+                                w.ssid,
+                                w.psk.chars().count()
+                            )
+                        };
+                        self.say(&mut outs, &ask);
+                        outs.push(Out::Act(Act::Join {
+                            ssid: w.ssid,
+                            psk: w.psk,
+                        }));
+                    }
+                    (None, None) => match r {
+                        Ok(payloads) => match payloads.into_iter().next() {
+                            // 非密码类码（URL/文本）：念前 40 字，全文进
+                            // 对话行（屏可看全）
+                            Some(p) => {
+                                let head: String = p.chars().take(40).collect();
+                                // 截断以 … 收尾，未截断以句号收尾
+                                let tail = if p.chars().count() > 40 {
+                                    "…".to_string()
+                                } else {
+                                    "。".to_string()
+                                };
+                                self.heard_line(&p);
+                                self.say(&mut outs, &format!("扫到，{head}{tail}"));
+                            }
+                            None => self.say(&mut outs, "没拍到二维码，正对着它再说扫码。"),
+                        },
+                        Err(_) => self.say(&mut outs, "没拍到二维码，正对着它再说扫码。"),
+                    },
+                }
+            }
+            Ev::OcrDone(r) => {
+                // M45 眼分支：识别行全文上屏（每行一条对话行，滚动窗取尾），
+                // 语音走 Say。短文整篇念（daemon 侧 split_clauses 分句流水）；
+                // 长文（>120 字）只念前两行——耳朵听不下整页，眼睛看屏。
+                match r {
+                    Ok(lines) if !lines.is_empty() => {
+                        for l in &lines {
+                            self.lines.push((false, l.clone()));
+                        }
+                        self.trim_lines();
+                        // 念一下本身就是要听（拉式语音的点名面）：Speak 只
+                        // 出声不再推行。段落合并走 join_reading——排版断行
+                        // 不插句号（旧 join("。") 的韵律错）。
+                        let joined = join_reading(&lines);
+                        if joined.chars().count() > 120 {
+                            let mut head = join_reading(&lines[..2]);
+                            if !ends_with_stop(&head) {
+                                head.push('。');
+                            }
+                            outs.push(Out::Speak(format!("{head}全文在屏幕上。")));
+                        } else {
+                            outs.push(Out::Speak(joined));
+                        }
+                    }
+                    Ok(_) | Err(_) => {
+                        self.say(&mut outs, "没拍到文字，正对着它再说念一下。");
+                    }
+                }
+            }
+            Ev::CallDone(end) => match end {
+                // 终局全 Speak（刀5b）：通话是耳朵的事，人挂完电话不一定
+                // 看屏——地板话要听得见。
+                CallEnd::NoNumber { name } => {
+                    self.say_loud(&mut outs, &format!("没找到{name}的号码。"))
+                }
+                CallEnd::Done => self.say_loud(&mut outs, "通话结束。"),
+                CallEnd::NoAnswer => self.say_loud(&mut outs, "没拨通，再说一次重拨。"),
+                CallEnd::Failed => self.say_loud(&mut outs, "呼叫失败，再说一次重试。"),
+            },
+        }
+        outs
+    }
+
+    /// 口令等待中的 Heard（面法B）。对 = 执行；错 = 计数，三错作废。
+    /// 全程 Speak（安全闸的判定必须听得见——这不是闲聊回应，是断电确认）。
+    fn step_power(&mut self, text: &str, outs: &mut Vec<Out>) {
+        let pw = self.power_wait.take().expect("step_power: no PowerWait");
+        if self.power_key.as_deref() == Some(text) {
+            self.say_loud(outs, &format!("口令正确，正在{}。", pw.action.verb()));
+            outs.push(Out::Act(Act::PowerExec { action: pw.action }));
+        } else if pw.tries + 1 >= POWER_TRIES {
+            self.say_loud(outs, "口令三次不对，已取消。");
+        } else {
+            self.power_wait = Some(PowerWait {
+                tries: pw.tries + 1,
+                ..pw
+            });
+            self.say_loud(outs, "口令不对，再说一次。");
+        }
+    }
+
+    fn step_idle(&mut self, text: &str, outs: &mut Vec<Out>) {
+        if is_close_eye(text) {
+            self.say(outs, "镜头关了。");
+            outs.push(Out::Act(Act::EyeClose));
+        } else if is_open_eye(text) {
+            self.say(outs, "镜头开了。");
+            outs.push(Out::Act(Act::Eye));
+        } else if is_scan(text) {
+            // is_scan 判在 is_wifi 之前：「扫码连无线」含「无线」，但主动词
+            // 是相机——口语里说要扫码，给相机。
+            self.say(outs, "拍照扫码，对准二维码别动。");
+            outs.push(Out::Act(Act::QrScan));
+        } else if is_ocr(text) {
+            // 念读也判在 is_wifi 前（「念一下」类词不含网络词，纯判序保守）
+            self.say(outs, "取景念字，对准文字别动。");
+            outs.push(Out::Act(Act::Ocr));
+        } else if is_wifi(text) {
+            self.say(outs, "看一下网络。");
+            outs.push(Out::Act(Act::NetConnect));
+        } else if is_status(text) {
+            self.say(outs, "看一下。");
+            outs.push(Out::Act(Act::Status));
+        } else if is_shutdown(text) || is_reboot(text) {
+            // 面法B 09-07：关机/重启是指令，但要口令（安全考虑——谁都能
+            // 对着手机喊一句话）。口令未设置 = fail-closed：词收下、闸不开。
+            // 物理电源键长按 1.2s 关机不设口令——系统卡死时的兜底阀。
+            let action = if is_shutdown(text) {
+                PowerAction::Poweroff
+            } else {
+                PowerAction::Reboot
+            };
+            match self.power_key {
+                Some(_) => {
+                    self.power_wait = Some(PowerWait {
+                        action,
+                        tries: 0,
+                        waited_ms: 0,
+                    });
+                    self.say_loud(outs, "请说口令。");
+                }
+                None => {
+                    self.say(
+                        outs,
+                        &format!("{}需要口令，口令还没设置。", action.verb()),
+                    );
+                }
+            }
+        } else if is_hello(text) {
+            self.say(outs, "我在。说连网，或说扫码、念一下。");
+        } else if is_help(text) {
+            self.say(
+                outs,
+                "我能连网、扫码、念字、关机、重启。回应都在屏幕上，要听我说，说你说给我听。",
+            );
+        } else if let Some(target) = call_target(text) {
+            // 刀5b 语音直拨：出声确认（对讲动作看不见脸，必须有可听反馈），
+            // 查名录/spawn 由 daemon 落地，终局回喂 CallDone。
+            self.say_loud(outs, &format!("正在呼叫{target}。"));
+            outs.push(Out::Act(Act::Call { target }));
+        } else {
+            if self.front {
+                // N2②：封闭词表 miss = 自由文本 → 母体（新前台）。封闭
+                // 词表本身仍本地优先（连网/扫码/念读是离线地板，不进
+                // brain 往返）；前台不可达由 daemon 收兜底话，这里不降级。
+                // v4：transcript 打字就是反馈（PTT/inject 臂已 set_line），
+                // 这里不再前置应答——那会瞬间顶掉用户刚说出的话。
+                outs.push(Out::Act(Act::Chat(text.to_string())));
+            } else {
+                self.say(outs, "没听懂。说连网，或扫码，或念一下。");
+            }
+        }
+    }
+}
+
+// ---------------- 归一化 ----------------
+
+/// ASR 后处理归一化：去标点/空白，全角转半角。保留大小写（拼读语义在大小写）。
+/// 例："连接无线。第三个密码，大写A小写B数字3。" → "连接无线第三个密码大写A小写B数字3"
+pub fn norm(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        // 全角 ASCII → 半角
+        let ch = match ch as u32 {
+            0xFF01..=0xFF5E => char::from_u32(ch as u32 - 0xFEE0).unwrap_or(ch),
+            0x3000 => ' ',
+            _ => ch,
+        };
+        // 标点（中英）与空白全去
+        if ch.is_whitespace() {
+            continue;
+        }
+        if matches!(
+            ch,
+            '。' | '，'
+                | '、'
+                | '！'
+                | '？'
+                | '：'
+                | '；'
+                | '…'
+                | '—'
+                | '·'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '（'
+                | '）'
+                | '《'
+                | '》'
+                | ','
+                | '.'
+                | '!'
+                | '?'
+                | ':'
+                | ';'
+                | '-'
+                | '_'
+                | '\''
+                | '"'
+                | '('
+                | ')'
+                | '<'
+                | '>'
+                | '+'
+                | '='
+                | '*'
+                | '&'
+                | '#'
+                | '@'
+                | '$'
+                | '%'
+                | '|'
+                | '\\'
+                | '/'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '^'
+                | '~'
+                | '`'
+        ) {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+// ---------------- 词表匹配 ----------------
+
+fn contains_any(lower: &str, words: &[&str]) -> bool {
+    words.iter().any(|w| lower.contains(w))
+}
+
+fn is_wifi(t: &str) -> bool {
+    let l = t.to_lowercase();
+    // 裸"网"不收（"网站""网游"全误触）；wi+fi 拆开是 ASR 常态
+    contains_any(
+        &l,
+        &[
+            "无线",
+            "网络",
+            "连网",
+            "上网",
+            "wifi",
+            "wi-fi",
+            "wi fi",
+            "连一下",
+        ],
+    ) || (l.contains("wi") && l.contains("fi"))
+}
+
+fn is_status(t: &str) -> bool {
+    contains_any(t, &["状态", "时间", "几点", "电池", "电量", "ip", "地址"])
+}
+
+fn is_hello(t: &str) -> bool {
+    contains_any(t, &["你在吗", "在吗", "你好", "喂"])
+}
+
+fn is_help(t: &str) -> bool {
+    contains_any(t, &["帮助", "能做什么", "你会什么", "怎么用"])
+}
+
+fn is_cancel(t: &str) -> bool {
+    contains_any(t, &["取消", "算了", "不弄了", "退出", "停止", "不干了"])
+}
+
+/// 点名要听（拉式语音的总开关词）。任何状态说这些词，都复述最近一条
+/// 机器话语。「念给我听」不收：那是 OCR 的拍+念（is_ocr），同词不同义。
+fn is_speak_request(t: &str) -> bool {
+    contains_any(
+        t,
+        &[
+            "你说给我听",
+            "说给我听",
+            "再说一遍",
+            "再念一遍",
+            "念一遍",
+            "重复",
+        ],
+    )
+}
+
+fn is_open_eye(t: &str) -> bool {
+    contains_any(t, &["打开镜头", "开镜头", "打开相机", "开相机"])
+}
+
+fn is_close_eye(t: &str) -> bool {
+    contains_any(t, &["关掉镜头", "关镜头", "关闭镜头", "关上镜头"])
+}
+
+fn is_scan(t: &str) -> bool {
+    // 相机主动词。与口语「重新扫」不撞：重扫的诉求已由「连网」重新
+    // 开眼覆盖（机器自己会再试）。
+    contains_any(t, &["扫码", "二维码", "扫一扫", "扫一下", "扫个码"])
+}
+
+fn is_ocr(t: &str) -> bool {
+    // M45 念读主动词。与 is_speak_request（念一遍/再说一遍——复述机器话）
+    // 不撞：「念一下」≠「念一遍」。裸「念」「读」不收（「念念不忘」误触）。
+    contains_any(
+        t,
+        &["念一下", "读一下", "念文字", "读文字", "念给我听", "这是什么字"],
+    )
+}
+
+/// 面法B 关机词。裸「关」不收（「关掉灯」误触）——主动词必须落在机器上。
+fn is_shutdown(t: &str) -> bool {
+    contains_any(t, &["关机", "关掉手机", "关闭手机", "把手机关了"])
+}
+
+/// 面法B 重启词（「重启」是口语主形；「重新启动」不含连续「重启」子串，
+/// 单列）。
+fn is_reboot(t: &str) -> bool {
+    contains_any(t, &["重启", "重新启动", "重启手机"])
+}
+
+/// 通话意图点名（刀5b）：三形——「找X语音」「打给X」「呼叫X」。
+/// 返回中段名（查名录在 daemon，大小写不敏感在那侧比）。找形取 找↔语音
+/// 之间的段（尾随「通话」等字自然截掉）；打给/呼收取后缀。
+fn call_target(t: &str) -> Option<String> {
+    if let (Some(i), Some(j)) = (t.find('找'), t.find("语音")) {
+        // 语音必须在找之后且中段非空（「语音找一下」不是点名）
+        let start = i + '找'.len_utf8();
+        if j > start {
+            return Some(t[start..j].to_string());
+        }
+    }
+    for p in ["打给", "呼叫"] {
+        if let Some(i) = t.find(p) {
+            let rest = &t[i + p.len()..];
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 行尾终止符：句/问/叹/分/省略——段落自然边界，保留原文不加工。
+fn ends_with_stop(s: &str) -> bool {
+    s.chars()
+        .next_back()
+        .map_or(false, |c| "。！？；…!?;".contains(c))
+}
+
+/// 行首列表符：•·-— 项目符，或 1. / 2) / 3） / (4) 编号起。裸数字
+/// （电话号 138…）不算——后面必须紧跟 . ) ） 收头。
+fn starts_list_item(s: &str) -> bool {
+    let t = s.trim_start();
+    let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        let after = &t[digits.len()..];
+        return after.starts_with('.') || after.starts_with(')') || after.starts_with('、');
+    }
+    if let Some(rest) = t.strip_prefix('(') {
+        let d: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        return !d.is_empty() && rest[d.len()..].starts_with(')');
+    }
+    t.starts_with('•') || t.starts_with('·') || t.starts_with('-') || t.starts_with('—')
+}
+
+/// S4 念读段落合并：OCR 行序列 → 可念的连续文本。旧的 `lines.join("。")`
+/// 在排版换行处硬插句号，TTS 韵律错（「把客厅的摄像。头调出来」）。
+/// 规则：
+/// - 行尾已是终止符（`。！？；…!?;`）或上行尾 `：` 或本行首是列表符或
+///   空行 → 段界，开新段；段内合并不插句号
+/// - 合并分隔：两侧皆 ASCII 字母数字 → 单空格（Latin 词界），任一侧
+///   CJK → 无空格（排版断行原样接回）
+/// - 段与段之间：前段自带标点（含 ：、，）直接拼；完全裸尾补一个句号
+///   （真段落边界，全停顿是对的——被修的是排版断行处的假句号）
+///   空行 = 硬段界。
+fn join_reading(lines: &[String]) -> String {
+    let mut segs: Vec<String> = Vec::new();
+    let mut hard_break = false; // 见过空行：下一非空行必开新段
+    for raw in lines {
+        let l = raw.trim();
+        if l.is_empty() {
+            hard_break = true;
+            continue;
+        }
+        let boundary = hard_break
+            || match segs.last() {
+                None => true,
+                Some(prev) => {
+                    ends_with_stop(prev) || prev.ends_with('：') || starts_list_item(l)
+                }
+            };
+        hard_break = false;
+        match segs.last_mut() {
+            Some(prev) if !boundary => {
+                let sep = if prev.chars().next_back().map_or(false, |c| c.is_ascii_alphanumeric())
+                    && l.chars().next().map_or(false, |c| c.is_ascii_alphanumeric())
+                {
+                    " "
+                } else {
+                    ""
+                };
+                prev.push_str(sep);
+                prev.push_str(l);
+            }
+            _ => segs.push(l.to_string()),
+        }
+    }
+    let mut out = String::new();
+    for s in &segs {
+        // 补号看前段尾（out）：已带标点直接拼，裸尾补一个句号
+        if !out.is_empty() && !out.ends_with(|c: char| "。！？；…!?;：，、,".contains(c)) {
+            out.push('。'); // 裸尾段：补一个句号（真段界）
+        }
+        out.push_str(s);
+    }
+    out
+}
+
+// ---------------- tests ----------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn heard(vm: &mut Vm, s: &str) -> Vec<Out> {
+        vm.step(Ev::Heard(s.into()))
+    }
+    fn says(outs: &[Out]) -> Vec<String> {
+        outs.iter()
+            .filter_map(|o| match o {
+                Out::Say(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    fn speaks(outs: &[Out]) -> Vec<String> {
+        outs.iter()
+            .filter_map(|o| match o {
+                Out::Speak(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    fn acts(outs: &[Out]) -> Vec<Act> {
+        outs.iter()
+            .filter_map(|o| match o {
+                Out::Act(a) => Some(a.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn norm_strips_punct_and_width() {
+        assert_eq!(
+            norm("连接无线。第三个密码，大写A小写B数字3。"),
+            "连接无线第三个密码大写A小写B数字3"
+        );
+        assert_eq!(norm("  WiFi 　测试 ！"), "WiFi测试");
+        assert_eq!(norm("Ａｂ３"), "Ab3");
+    }
+
+    // ---------------- 连网：命令优先（2026-09-06 重设计） ----------------
+
+    #[test]
+    fn wifi_words_fire_netconnect() {
+        for w in ["连接无线网络", "连网", "连wifi", "上网", "连一下"] {
+            let mut vm = Vm::new();
+            let o = heard(&mut vm, w);
+            assert!(acts(&o).contains(&Act::NetConnect), "「{w}」应触发 NetConnect");
+            assert!(!acts(&o).contains(&Act::QrScan));
+        }
+        // 相机词优先：扫码连无线给相机，不给网络
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "扫码连无线");
+        assert!(acts(&o).contains(&Act::QrScan));
+        assert!(!acts(&o).contains(&Act::NetConnect));
+    }
+
+    #[test]
+    fn open_lens_opens_eye() {
+        for w in ["打开镜头", "开镜头", "打开相机"] {
+            let mut vm = Vm::new();
+            let o = heard(&mut vm, w);
+            assert!(acts(&o).contains(&Act::Eye), "「{w}」应开眼");
+            assert!(!acts(&o).contains(&Act::QrScan));
+        }
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "关掉镜头");
+        assert!(acts(&o).contains(&Act::EyeClose));
+    }
+
+    #[test]
+    fn netstate_up_says_connected_only() {
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::NetState(NetState::Up));
+        assert_eq!(says(&o), vec!["网已连。"]);
+        assert!(acts(&o).is_empty()); // 机器不画蛇添足
+    }
+
+    #[test]
+    fn netstate_missing_or_failed_opens_eye() {
+        for ns in [NetState::NoConf, NetState::ConfFail] {
+            let mut vm = Vm::new();
+            let o = vm.step(Ev::NetState(ns));
+            assert_eq!(says(&o), vec!["对准配对码或无线码。"]);
+            assert!(acts(&o).contains(&Act::Eye));
+        }
+    }
+
+    #[test]
+    fn pair_code_auto_applies_without_confirmation() {
+        let b = aginx_qr::PairBundle::try_new(
+            "Legrand AP",
+            "p4ss w0rd!",
+            "sk-123",
+            "cf49973e",
+            "relaysec",
+        )
+        .unwrap();
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::QrDone(Ok(vec![b.payload()])));
+        assert_eq!(says(&o), vec!["扫到Legrand AP的配对码，连接配对。"]);
+        assert_eq!(
+            acts(&o),
+            vec![Act::PairApply {
+                bundle: b.clone()
+            }]
+        );
+        // 秘密卫生：psk / brain key / relay secret 一个都不上对话行
+        let shown: String = vm.lines().iter().map(|(_, s)| s.as_str()).collect();
+        assert!(!shown.contains("p4ss"));
+        assert!(!shown.contains("sk-123"));
+        assert!(!shown.contains("relaysec"));
+    }
+
+    #[test]
+    fn pair_code_beats_wifi_code() {
+        let b = aginx_qr::PairBundle::try_new("ap", "pw", "k", "g", "s").unwrap();
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::QrDone(Ok(vec![
+            "WIFI:T:WPA;S:other;P:zz;;".into(),
+            b.payload(),
+        ])));
+        assert!(matches!(acts(&o).as_slice(), &[Act::PairApply { .. }]));
+        assert!(!o.iter().any(|x| matches!(x, Out::Act(Act::Join { .. }))));
+    }
+
+    #[test]
+    fn connect_noconf_then_wifi_code_happy_path() {
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "连网");
+        assert_eq!(says(&o), vec!["看一下网络。"]);
+        assert!(acts(&o).contains(&Act::NetConnect));
+        let o = vm.step(Ev::NetState(NetState::NoConf));
+        assert!(acts(&o).contains(&Act::Eye));
+        // 用户把 WiFi 码怼到镜头前
+        let o = vm.step(Ev::QrDone(Ok(vec!["WIFI:T:WPA;S:home-ap;P:secret8;;".into()])));
+        assert_eq!(says(&o), vec!["扫到网络home-ap，密码7位，连接。"]);
+        assert!(acts(&o).contains(&Act::Join {
+            ssid: "home-ap".into(),
+            psk: "secret8".into()
+        }));
+        let shown: String = vm.lines().iter().map(|(_, s)| s.as_str()).collect();
+        assert!(!shown.contains("secret8")); // psk 永不上屏
+        let o = vm.step(Ev::JoinDone(Ok("192.168.0.166".into())));
+        assert_eq!(says(&o), vec!["连上了，地址192.168.0.166。"]);
+        assert_eq!(vm.state_name(), "idle");
+    }
+
+    #[test]
+    fn pair_done_reports_and_closes_the_eye() {
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::PairDone(Ok("网已连，母体在线".into())));
+        assert_eq!(says(&o), vec!["配对完成，网已连，母体在线。"]);
+        assert_eq!(
+            speaks(&o),
+            vec!["Connection restored. Welcome to the real world."]
+        );
+        // 配对成功收镜头（#246：码到手取景的活就干完了）
+        assert!(acts(&o).contains(&Act::EyeClose));
+        let o = vm.step(Ev::PairDone(Err("时钟没同步".into())));
+        assert_eq!(says(&o), vec!["配对没成，时钟没同步。再说连网重试。"]);
+        assert!(acts(&o).is_empty()); // 失败不自动循环，人再说连网
+    }
+
+    #[test]
+    fn cancel_closes_the_eye() {
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "算了");
+        assert_eq!(says(&o), vec!["已取消。"]);
+        assert!(acts(&o).contains(&Act::EyeClose));
+    }
+
+    // ---------------- M42b QR ----------------
+
+    #[test]
+    fn scan_word_fires_qr_not_wifi() {
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "扫码");
+        assert!(acts(&o).contains(&Act::QrScan));
+        // 纯 wifi 词不碰相机
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "连接无线网络");
+        assert!(acts(&o).contains(&Act::NetConnect));
+        assert!(!acts(&o).contains(&Act::QrScan));
+    }
+
+    #[test]
+    fn qr_wifi_flow_auto_joins() {
+        // M42g：扫码即指令——WIFI: 码不过确认，直接 Act::Join
+        let mut vm = Vm::new();
+        // 多码：跳过非 WIFI 码取第一个 WIFI
+        let o = vm.step(Ev::QrDone(Ok(vec![
+            "https://aginx.net".into(),
+            "WIFI:T:WPA;S:home-ap;P:secret8;;".into(),
+        ])));
+        assert_eq!(says(&o), vec!["扫到网络home-ap，密码7位，连接。"]);
+        assert!(o.contains(&Out::Act(Act::Join {
+            ssid: "home-ap".into(),
+            psk: "secret8".into()
+        })));
+        let o = vm.step(Ev::JoinDone(Ok("10.0.0.5".into())));
+        assert_eq!(says(&o), vec!["连上了，地址10.0.0.5。"]);
+        assert_eq!(vm.state_name(), "idle");
+    }
+
+    #[test]
+    fn qr_open_net_auto_joins_empty_psk() {
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::QrDone(Ok(vec!["WIFI:S:opennet;;".into()])));
+        assert_eq!(says(&o), vec!["扫到网络opennet，开放网络，连接。"]);
+        assert!(o.contains(&Out::Act(Act::Join {
+            ssid: "opennet".into(),
+            psk: "".into()
+        })));
+    }
+
+    #[test]
+    fn qr_text_truncated_and_empty_and_err() {
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::QrDone(Ok(vec!["https://aginx.net/pkg".into()])));
+        assert_eq!(says(&o), vec!["扫到，https://aginx.net/pkg。"]);
+        // 长文本截到 40 字 + 省略号
+        let long = "a".repeat(50);
+        let o = vm.step(Ev::QrDone(Ok(vec![long])));
+        assert_eq!(says(&o), vec![format!("扫到，{}…", "a".repeat(40))]);
+        // 拍了但没码 / 相机失败：同一句引导（原因进 daemon 日志）
+        let o = vm.step(Ev::QrDone(Ok(vec![])));
+        assert_eq!(says(&o), vec!["没拍到二维码，正对着它再说扫码。"]);
+        let o = vm.step(Ev::QrDone(Err("cam-shot rc=1".into())));
+        assert_eq!(says(&o), vec!["没拍到二维码，正对着它再说扫码。"]);
+        assert_eq!(vm.state_name(), "idle");
+    }
+
+    // ---------------- M45 OCR ----------------
+
+    #[test]
+    fn ocr_fires_from_idle_and_not_scan() {
+        for w in ["念一下", "读一下", "念文字", "读文字", "念给我听", "这是什么字"] {
+            let mut vm = Vm::new();
+            let o = heard(&mut vm, w);
+            assert!(o.contains(&Out::Act(Act::Ocr)), "「{w}」应触发 OCR");
+            assert!(!o.contains(&Out::Act(Act::QrScan)), "「{w}」不应触发扫码");
+            assert!(!o.contains(&Out::Act(Act::NetConnect)), "「{w}」不应触发连网");
+        }
+        // 反向：扫码词不进 OCR
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "扫码");
+        assert!(o.contains(&Out::Act(Act::QrScan)));
+        assert!(!o.contains(&Out::Act(Act::Ocr)));
+    }
+
+    #[test]
+    fn ocr_done_short_reads_all_long_reads_head() {
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::OcrDone(Ok(vec![
+            "机器视觉测试".into(),
+            "TEL 138-0013-8000".into(),
+        ])));
+        // 短文：段落合并成整篇念（daemon split_clauses 分句）——拉式语音
+        // 下念一下仍是点名面：Speak。行间不插句号（join_reading；旧
+        // join("。") 的句号就是被修的错）
+        assert_eq!(speaks(&o), vec!["机器视觉测试TEL 138-0013-8000"]);
+        // 全文上屏：每行一条对话行（Speak 不再重复推行）
+        let shown: Vec<&str> = vm.lines().iter().map(|(_, s)| s.as_str()).collect();
+        assert!(shown.contains(&"机器视觉测试"));
+        assert!(shown.contains(&"TEL 138-0013-8000"));
+        assert_eq!(vm.lines().len(), 2);
+
+        // 长文（>120 字）：只念前两行（合并后补终止符）+ 指屏
+        let mut vm = Vm::new();
+        let lines: Vec<String> = (0..5).map(|i| format!("第{i}行{}", "字".repeat(30))).collect();
+        let o = vm.step(Ev::OcrDone(Ok(lines.clone())));
+        assert_eq!(
+            speaks(&o),
+            vec![format!("{}{}。全文在屏幕上。", lines[0], lines[1])]
+        );
+        assert_eq!(vm.lines().len(), 5);
+    }
+
+    // ---------------- S4 join_reading：段落合并 ----------------
+
+    fn jr(lines: &[&str]) -> String {
+        join_reading(&lines.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn join_reading_layout_break_glues_without_stop() {
+        // 排版断行：接回不插句号（原 bug：「把客厅的摄像。头调出来」）
+        assert_eq!(jr(&["把客厅的摄像", "头调出来"]), "把客厅的摄像头调出来");
+        // Latin 词界：两侧皆 ASCII 字母数字 → 单空格
+        assert_eq!(jr(&["Second line", "OCR test"]), "Second line OCR test");
+        // CJK↔Latin 混排断行：无空格
+        assert_eq!(jr(&["型号是", "A123 型"]), "型号是A123 型");
+    }
+
+    #[test]
+    fn join_reading_keeps_existing_stops() {
+        // 行尾终止符 = 段界，保留原文；段内续行接回
+        assert_eq!(jr(&["第一句。", "第二句"]), "第一句。第二句");
+        assert_eq!(jr(&["几岁了？", "三岁", "你呢"]), "几岁了？三岁你呢");
+        // 空行 = 硬段界：裸尾段之间补一个句号（真段界的全停顿是对的）
+        assert_eq!(jr(&["第一段", "", "第二段"]), "第一段。第二段");
+    }
+
+    #[test]
+    fn join_reading_list_and_colon_start_new_segment() {
+        // 上行尾 ：→ 开新段；列表符/编号起 → 开新段
+        assert_eq!(
+            jr(&["三件事：", "1. 买菜", "2. 打电话"]),
+            "三件事：1. 买菜。2. 打电话"
+        );
+        assert_eq!(jr(&["• 甲项", "• 乙项"]), "• 甲项。• 乙项");
+        // 裸数字不是列表（电话号行）
+        assert_eq!(jr(&["电话", "13800138000"]), "电话13800138000");
+    }
+
+    #[test]
+    fn ocr_done_empty_and_err_prompt_retry() {
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::OcrDone(Ok(vec![])));
+        assert_eq!(says(&o), vec!["没拍到文字，正对着它再说念一下。"]);
+        let o = vm.step(Ev::OcrDone(Err("ag-ocr rc=2".into())));
+        assert_eq!(says(&o), vec!["没拍到文字，正对着它再说念一下。"]);
+    }
+
+    // ---------------- 拉式语音（2026-09-04） ----------------
+
+    #[test]
+    fn speak_request_replays_last_agent_line() {
+        let mut vm = Vm::new();
+        // 没说过话：点名 → 出声告知（而不是无声）
+        let o = heard(&mut vm, "你说给我听");
+        assert_eq!(speaks(&o), vec!["我还没说过话。"]);
+        // 有过话语：复述最近一条机器行
+        let o = heard(&mut vm, "你好");
+        assert_eq!(says(&o), vec!["我在。说连网，或说扫码、念一下。"]);
+        let o = heard(&mut vm, "说给我听");
+        assert_eq!(speaks(&o), vec!["我在。说连网，或说扫码、念一下。"]);
+        // 连网提示也一样能复述
+        let _ = heard(&mut vm, "连网");
+        let o = heard(&mut vm, "再念一遍");
+        assert_eq!(speaks(&o), vec!["看一下网络。"]);
+    }
+
+    #[test]
+    fn chatter_is_quiet_by_default() {
+        // 拉式语音：常规回应是 Say（daemon 只上脸），不是 Speak
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "无线");
+        assert!(!o.iter().any(|o| matches!(o, Out::Speak(_))));
+        let o = vm.step(Ev::JoinDone(Ok("192.168.0.166".into())));
+        assert_eq!(says(&o), vec!["连上了，地址192.168.0.166。"]);
+        assert!(o.iter().all(|o| !matches!(o, Out::Speak(_))));
+        // 状态查询（inject_say）也是 Say——屏显，想听跟一句你说给我听
+        let o = heard(&mut vm, "状态");
+        assert!(matches!(o[0], Out::Say(_)));
+    }
+
+    #[test]
+    fn empty_heard_prompts_retry() {
+        // 2026-09-04 改：空 ASR 静默=用户以为死了；真误触(<0.1s)在
+        // capture_take 已拦，走到这的都是 ≥0.1s 的真尝试，必须开口。
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "。！？ ");
+        assert_eq!(says(&o), vec!["没听清。请按住键说。"]);
+    }
+
+    #[test]
+    fn gibberish_gets_fixed_reply() {
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "今天天气哈哈哈");
+        assert_eq!(says(&o), vec!["没听懂。说连网，或扫码，或念一下。"]);
+    }
+
+    // ---------------- N2②：前台模式（自由文本 → Act::Chat） ----------------
+
+    #[test]
+    fn front_off_free_text_falls_to_didnotunderstand() {
+        // 老行为分毫不动：不开前台，自由文本还是没听懂地板
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "今天北京天气怎么样");
+        assert_eq!(says(&o), vec!["没听懂。说连网，或扫码，或念一下。"]);
+        assert!(o.iter().all(|x| !matches!(x, Out::Act(Act::Chat(_)))));
+    }
+
+    #[test]
+    fn front_on_free_text_routes_to_chat() {
+        let mut vm = Vm::with_front();
+        let o = heard(&mut vm, "今天北京天气怎么样");
+        // v4：无前置应答——transcript 打字就是反馈，机器不抢行
+        assert!(says(&o).is_empty());
+        let chat = o.iter().find_map(|x| match x {
+            Out::Act(Act::Chat(t)) => Some(t.clone()),
+            _ => None,
+        });
+        assert_eq!(chat, Some("今天北京天气怎么样".to_string()));
+    }
+
+    #[test]
+    fn front_on_closed_vocab_stays_local() {
+        // 离线地板不进 brain 往返：连网/状态/问好全本地
+        let mut vm = Vm::with_front();
+        let o = heard(&mut vm, "连接无线网络");
+        assert!(matches!(o.iter().find(|x| matches!(x, Out::Act(_))), Some(Out::Act(Act::NetConnect))));
+        assert_eq!(says(&o), vec!["看一下网络。"]);
+
+        let o = heard(&mut vm, "你好");
+        assert_eq!(says(&o), vec!["我在。说连网，或说扫码、念一下。"]);
+
+        let o = heard(&mut vm, "现在几点了");
+        assert!(matches!(
+            o.iter().find(|x| matches!(x, Out::Act(_))),
+            Some(Out::Act(Act::Status))
+        ));
+    }
+
+    #[test]
+    fn front_on_cancel_and_speak_still_work() {
+        // 取消/点名出声与前台无关：优先级在自由文本之前
+        let mut vm = Vm::with_front();
+        let o = heard(&mut vm, "取消");
+        assert_eq!(says(&o), vec!["已取消。"]);
+
+        let _ = heard(&mut vm, "今天北京天气怎么样"); // 问母体（daemon 出去）
+        let o = heard(&mut vm, "你说给我听");
+        assert_eq!(speaks(&o).len(), 1); // 复述最后一句机器行
+    }
+
+    // ---------------- 面法B：关机/重启口令（2026-09-07） ----------------
+
+    #[test]
+    fn power_words_fail_closed_without_key() {
+        // 未设口令：词收下、闸不开、绝不执行——fail-closed 是安全语义
+        for (w, verb) in [
+            ("关机", "关机"),
+            ("把手机关了", "关机"),
+            ("重启", "重启"),
+            ("重新启动", "重启"),
+            ("重启手机", "重启"),
+        ] {
+            let mut vm = Vm::new();
+            let o = heard(&mut vm, w);
+            assert_eq!(says(&o), vec![format!("{verb}需要口令，口令还没设置。")], "「{w}」");
+            assert!(acts(&o).is_empty(), "「{w}」不该有动作");
+            assert_eq!(vm.state_name(), "idle");
+        }
+        // 空串口令（daemon filter 掉）同未设置
+        let mut vm = Vm::new().with_power_key(Some("".into()));
+        let o = heard(&mut vm, "关机");
+        assert_eq!(says(&o), vec!["关机需要口令，口令还没设置。"]);
+    }
+
+    #[test]
+    fn power_wait_correct_key_executes() {
+        let mut vm = Vm::new().with_power_key(Some(norm("红色药丸")));
+        let o = heard(&mut vm, "关机");
+        assert_eq!(speaks(&o), vec!["请说口令。"]);
+        assert!(acts(&o).is_empty());
+        assert_eq!(vm.state_name(), "powerwait");
+        // 带标点/大小写走同一 norm——口令怎么说的就怎么比
+        let o = heard(&mut vm, "红色药丸。");
+        assert_eq!(speaks(&o), vec!["口令正确，正在关机。"]);
+        assert_eq!(
+            acts(&o),
+            vec![Act::PowerExec {
+                action: PowerAction::Poweroff
+            }]
+        );
+        assert_eq!(vm.state_name(), "idle");
+        // 口令不上对话行（psk 同律）：对错尝试的原文都不在
+        let shown: String = vm.lines().iter().map(|(_, s)| s.as_str()).collect();
+        assert!(!shown.contains("红色药丸"), "口令原文不得上面/脸");
+    }
+
+    #[test]
+    fn power_wait_reboot_uses_reboot_action() {
+        let mut vm = Vm::new().with_power_key(Some("九四八七".into()));
+        let o = heard(&mut vm, "重启");
+        assert_eq!(speaks(&o), vec!["请说口令。"]);
+        let o = heard(&mut vm, "九四八七");
+        assert_eq!(speaks(&o), vec!["口令正确，正在重启。"]);
+        assert_eq!(
+            acts(&o),
+            vec![Act::PowerExec {
+                action: PowerAction::Reboot
+            }]
+        );
+    }
+
+    #[test]
+    fn power_wait_three_wrong_cancels() {
+        let mut vm = Vm::new().with_power_key(Some("对的口令".into()));
+        let _ = heard(&mut vm, "关机");
+        let o = heard(&mut vm, "错的一次");
+        assert_eq!(speaks(&o), vec!["口令不对，再说一次。"]);
+        assert_eq!(vm.state_name(), "powerwait");
+        let _ = heard(&mut vm, "错的两次");
+        assert_eq!(vm.state_name(), "powerwait", "第二次错仍在等");
+        let o = heard(&mut vm, "错的三次");
+        assert_eq!(speaks(&o), vec!["口令三次不对，已取消。"]);
+        assert!(acts(&o).is_empty(), "三错作废，绝不执行");
+        assert_eq!(vm.state_name(), "idle");
+        // 作废不残留：再说关机重新进等待、计数清零
+        let o = heard(&mut vm, "关机");
+        assert_eq!(speaks(&o), vec!["请说口令。"]);
+        let o = heard(&mut vm, "对的口令");
+        assert_eq!(
+            acts(&o),
+            vec![Act::PowerExec {
+                action: PowerAction::Poweroff
+            }]
+        );
+    }
+
+    #[test]
+    fn power_wait_cancel_and_timeout() {
+        let mut vm = Vm::new().with_power_key(Some("口令".into()));
+        let _ = heard(&mut vm, "关机");
+        // 取消：等待作废（EyeClose 是取消的既有落点，没开则空转）
+        let o = heard(&mut vm, "取消");
+        assert_eq!(says(&o), vec!["已取消。"]);
+        assert!(acts(&o).contains(&Act::EyeClose));
+        assert_eq!(vm.state_name(), "idle");
+        // 等待中点名要听：复述「请说口令」（口令等待不吞拉式语音）
+        let _ = heard(&mut vm, "关机");
+        let o = heard(&mut vm, "你说给我听");
+        assert_eq!(speaks(&o), vec!["请说口令。"]);
+        assert_eq!(vm.state_name(), "powerwait");
+        // 超时：Tick 累计到预算 → 作废回 idle（Say——人多半已走开，不喊）
+        assert!(vm.step(Ev::Tick(29_000)).is_empty(), "预算内不吭声");
+        let o = vm.step(Ev::Tick(2_000));
+        assert_eq!(says(&o), vec!["太久没说口令，已取消。"]);
+        assert_eq!(vm.state_name(), "idle");
+        // idle 心跳：空往返零输出
+        assert!(vm.step(Ev::Tick(1_000)).is_empty());
+        // 重启词与关机词同一闸不同动作（超时后换重启重新进等待）
+        let _ = heard(&mut vm, "重启");
+        assert_eq!(vm.state_name(), "powerwait");
+    }
+
+    #[test]
+    fn power_words_are_closed_vocab_not_chat() {
+        // 开前台时关机词仍本地——安全闸不进 brain 往返
+        let mut vm = Vm::with_front().with_power_key(Some("口令".into()));
+        let o = heard(&mut vm, "关机");
+        assert_eq!(speaks(&o), vec!["请说口令。"]);
+        assert!(o.iter().all(|x| !matches!(x, Out::Act(Act::Chat(_)))));
+    }
+
+    // ---------------- 刀5b：语音直拨（2026-09-28） ----------------
+
+    #[test]
+    fn call_words_fire_act_with_target() {
+        // 三形点名：找X语音 / 打给X / 呼叫X
+        for (w, target) in [
+            ("找mac语音", "mac"),
+            ("找Mac语音通话", "Mac"), // 尾随字被找形自然截掉
+            ("打给mac", "mac"),
+            ("呼叫Mac", "Mac"),
+        ] {
+            let mut vm = Vm::new();
+            let o = heard(&mut vm, w);
+            assert_eq!(
+                acts(&o),
+                vec![Act::Call {
+                    target: target.into()
+                }],
+                "「{w}」"
+            );
+            // 出声确认（对讲动作看不见脸）
+            assert_eq!(speaks(&o), vec![format!("正在呼叫{target}。")], "「{w}」");
+        }
+    }
+
+    #[test]
+    fn call_intent_edge_shapes() {
+        // 裸「找语音」（无中段）/裸「打给」不触发——落 Chat/地板
+        for w in ["找语音", "打给", "呼叫"] {
+            let mut vm = Vm::new();
+            let o = heard(&mut vm, w);
+            assert!(o.iter().all(|x| !matches!(x, Out::Act(Act::Call { .. }))), "「{w}」");
+        }
+        // 语音在找之前：找形不成立（不是点名）
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "语音找一下");
+        assert!(o.iter().all(|x| !matches!(x, Out::Act(Act::Call { .. }))));
+    }
+
+    #[test]
+    fn call_done_three_terminal_states() {
+        // 查无此人
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::CallDone(CallEnd::NoNumber { name: "mac".into() }));
+        assert_eq!(speaks(&o), vec!["没找到mac的号码。"]);
+        // 接通后挂断
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::CallDone(CallEnd::Done));
+        assert_eq!(speaks(&o), vec!["通话结束。"]);
+        // 没接通（15s 窗尽）
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::CallDone(CallEnd::NoAnswer));
+        assert_eq!(speaks(&o), vec!["没拨通，再说一次重拨。"]);
+        // 起不来/桥断
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::CallDone(CallEnd::Failed));
+        assert_eq!(speaks(&o), vec!["呼叫失败，再说一次重试。"]);
+        // 终局回 idle：没有驻留态
+        assert_eq!(vm.state_name(), "idle");
+    }
+
+    #[test]
+    fn call_words_are_closed_vocab_not_chat() {
+        // 零脑直拨：开前台时通话词仍本地，不进 brain 往返
+        let mut vm = Vm::with_front();
+        let o = heard(&mut vm, "找mac语音");
+        assert_eq!(
+            acts(&o),
+            vec![Act::Call {
+                target: "mac".into()
+            }]
+        );
+        assert!(o.iter().all(|x| !matches!(x, Out::Act(Act::Chat(_)))));
+    }
+
+    #[test]
+    fn call_words_zero_perturbation_on_old_intents() {
+        // 新词不偷旧意图：连网/扫码/念读/关机原样
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "连接无线网络");
+        assert!(acts(&o).contains(&Act::NetConnect));
+        assert!(o.iter().all(|x| !matches!(x, Out::Act(Act::Call { .. }))));
+        let o = heard(&mut vm, "扫码");
+        assert!(acts(&o).contains(&Act::QrScan));
+        let o = heard(&mut vm, "念一下");
+        assert!(acts(&o).contains(&Act::Ocr));
+        let mut vm = Vm::new().with_power_key(Some("口令".into()));
+        let o = heard(&mut vm, "关机");
+        assert_eq!(speaks(&o), vec!["请说口令。"]);
+    }
+}

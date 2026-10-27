@@ -1,0 +1,17 @@
+[package]
+name = "aginx-img"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JPEG decode for aginx-term's photo viewer (M39) — vendored libjpeg-turbo"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"
+
+# v4④：term 的 result.img 是 aginxbrowser 截图（PNG only，"Always png for
+# now"）——decode_scaled 按 magic 嗅探分 JPEG/PNG 两路。
+[dependencies.png]
+version = "0.17"
+default-features = false

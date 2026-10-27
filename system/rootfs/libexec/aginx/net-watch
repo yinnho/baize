@@ -1,0 +1,402 @@
+#!/bin/sh
+# net-watch (M20b) — steady-state network healer.
+#
+# aginx-svcd unit (inittab -> aginx-svcd -> this). Watches the WLAN link that
+# net-bringup established and, when it dies — the Legrand AP drops the
+# association under sustained transfers (observed 3x on 2026-09-02,
+# killing a 223 MB provision download twice) — rejoins IN PLACE via
+# net-rejoin instead of waiting for a human. WAN-side outages (gateway
+# answers, internet gone) are logged but not rejoined: that is not ours
+# to fix.
+#
+# Probe: every 15 s ping the default gateway (link-local truth, no DNS
+# involved). 3 consecutive fails -> net-rejoin. Rejoin blocks the loop
+# for its own duration (up to ~1 min); the failure counter resets after
+# an attempt either way, so a persistently dead AP means one rejoin
+# attempt per ~45 s, not a tight spin.
+#
+# 有线兜底腿（X2 W2, 2026-10-11）：服务器板无 wifi 面时本守护仍是
+# 守门人——gw 探测按运输无关跑，断链 heal 分叉到有线 udhcpc 重租
+#（详见下方 wired_if/heal 注释）。手机无 eth 口，整腿不生效。
+#
+# 电量腿（redfin 掉电案, 2026-10-11）：term/voice 两张电量显示脸随
+# 黑匣子裁决死后，带电池的机器没人看电量——10-11 晚静默掉到 0% 关机
+# 实发。每环读 battery psy（无此 psy 的服务器板=整腿 no-op，机器盲）：
+# 放电 ≤20% 告警+落警告注册表、≤10% 危急告警、≥30% 撤警（迟滞防抖）；
+# 接上外电播报一次「已接上电源」。充电无效探针（10-11 晨补）：外电在
+# 而容量停在低电带 N 分钟不涨=线材/充电头的病——「0% Charging 一夜
+# 干死」的盲区（低电告警只看放电沿）。告警走微信腿 best-effort——
+# 会话过期/无频道路时只记账，不阻塞探测环。
+#
+# CPU 看门狗腿（Mac grok 死转案, 2026-10-11）：Mac 上一个孤儿
+# grok（裸调无 timeout、父进程已死、SIGTERM 不理）烧满一核
+# 13.7 小时才被撞见。带电池的黑匣子机器同样的事一夜干死机器，
+# 而电量腿看的是症状——掉到 20% 才叫，烧核者是谁没人点名。本腿
+# 每环 schedstat 采样（本系 utime 是冻结垃圾，sum_exec_runtime 是
+# 唯一真源），单进程持续占核 ≥CPUHOG_PCT 达 CPUHOG_MIN 分钟 →
+# 微信点名+警告注册表；只报不杀（误杀比晚杀贵）。窗口按实测耗时
+# 归一（idle 60s 档/heal 阻塞不失真）。机器盲：内核无 schedstat
+# 整腿 no-op。
+#
+# Boot race: net-bringup owns the FIRST join (its 2-attempt pair with
+# boot.state reporting). We stay hands-off until it has written its
+# `done` verdict (ok or fail), up to 10 min. No /etc/wifi.conf yet
+# (first boot, wizard not run): idle in a slow loop instead of
+# attempting anything — and no warn file either (unpaired ≠ offline).
+#
+# Warn duty (2026-09-09): the same probe loop is the v0 writer of the
+# warning registry /run/aginx-warn/ — link lost (2 probes) →
+# 「无网络 · 自动重连中」, upstream dead (gateway ok, wan down 8 probes) →
+# 「无网络 · 上游断连」, both-up is the only clear.
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+# 警告注册表 (2026-09-09): /run/aginx-warn/ — one warning = one file
+# (filename = source tag, content = one-line CJK message). v0 sole writer
+# is this daemon; the term standby face polls the dir and paints a red
+# center zone while non-empty (same shape as the D12 file-system
+# registry — future daemons drop a file in, no term change).
+IF=${IF:-wlan0}
+WAN_PROBE=223.5.5.5   # anycast IP — deliberately DNS-free
+FAILS_TRIP=3
+WARN_TRIP=2           # probes before the red face (FAILS_TRIP rejoin-only)
+LOG=/var/log/net-watch.log
+STATE=/run/boot.state
+WARN_DIR=/run/aginx-warn
+WARN_NET=$WARN_DIR/net
+
+# 有线兜底腿（X2 W2，2026-10-11）：服务器板的常驻运输是网口，wifi 才是
+# 选装。rejoin 一词从此按运输分叉——wifi 腿=net-rejoin（重关联+重租），
+# 有线腿=udhcpc 重租（链路回来了 DHCP 就能重建路由）。机器盲：只看
+# /sys/class/net 载波，零机型串（手机无 eth 口=恒空，整腿不生效，
+# 行为与旧版逐字节同）。phone 上 wlan0 归 wlan* 类跳过——它与 wifi 腿
+# 的 IF 名重合是巧合不是约定。
+wired_if() {  # echo 第一个有载波的非 lo/wlan 口；无则 rc1
+  for i in /sys/class/net/*; do
+    n=${i##*/}
+    case "$n" in lo|wlan*) continue ;; esac
+    [ "$(cat "$i/carrier" 2>/dev/null)" = "1" ] && { echo "$n"; return 0; }
+  done
+  return 1
+}
+
+# 断链自愈的运输分叉：wifi.conf 在=先 wifi rejoin（旧行为原序），败或
+# 无 conf 落有线 udhcpc（-n -q -t4 有界 ~12s，与 rejoin 的阻塞纪律同）。
+# 两腿全无=只记账（无运输可医）。
+#
+# 踢频道（2026-10-12）：换地点/AP 抖动后 iLink 长轮询会挂在旧半开
+# 连接上最多 ~40s 才超时；网刚回来立刻 restart aginx-channels，让
+# getUpdates 马上用新 DNS/源地址重挂，而不是干等到长轮询超时。
+# best-effort：没装频道包/ctl 不在=只记账，不挡 heal。
+kick_channels() {
+  if [ -x /usr/bin/aginx-svc ]; then
+    if /usr/bin/aginx-svc restart aginx-channels >>"$LOG" 2>&1; then
+      log "kicked aginx-channels (net heal)"
+    else
+      log "kick aginx-channels failed (aginx-svc)"
+    fi
+  elif [ -x /var/bin/aginx ]; then
+    if /var/bin/aginx svc restart aginx-channels >>"$LOG" 2>&1; then
+      log "kicked aginx-channels (net heal)"
+    else
+      log "kick aginx-channels failed (aginx svc)"
+    fi
+  else
+    log "kick aginx-channels skipped — no svc CLI"
+  fi
+}
+
+heal() {
+  if [ -f /etc/wifi.conf ] && /usr/libexec/aginx/net-rejoin >>"$LOG" 2>&1; then
+    log "rejoin ok"
+    kick_channels
+  elif W=$(wired_if); then
+    log "wifi heal unavailable — wired udhcpc on $W"
+    if udhcpc -i "$W" -n -q -t 4 -T 3 >>"$LOG" 2>&1; then
+      kick_channels
+    fi
+  else
+    log "no transport to heal"
+  fi
+}
+
+log() { echo "$(date +%m%d-%H:%M:%S) $*" >>"$LOG"; }
+
+# ---- 电量腿（2026-10-11）----
+HOST=$(hostname)
+BATT_PSY=/sys/class/power_supply/battery
+BATT_WARN=${BATT_WARN:-20}
+BATT_CRIT=${BATT_CRIT:-10}
+BATT_CLEAR=${BATT_CLEAR:-30}
+WARN_BATT=$WARN_DIR/battery
+batt_on=0    # 0=净 1=已低电告警 2=已危急告警（迟滞态）
+batt_ext=-1  # -1=未知 0=放电 1=外电——只在跳变沿动作
+batt_stuck=0 # 外电在而容量不涨的连续环数（充电无效探针）
+batt_anchor=0
+BATT_STUCK_MIN=${BATT_STUCK_MIN:-30}
+
+batt_write() {  # $1 一行文案；空=撤（与 warn_net 同款原子写）
+  if [ -n "$1" ]; then
+    printf '%s\n' "$1" >"$WARN_BATT.t" 2>/dev/null && mv "$WARN_BATT.t" "$WARN_BATT"
+  else
+    rm -f "$WARN_BATT"
+  fi
+}
+
+batt_send() {  # $1 文案；微信腿 best-effort，发不出去只记账
+  if [ -x /var/bin/aginx-channels ]; then
+    uid=$(/var/bin/aginx-channels status 2>/dev/null \
+      | sed -n 's/.*"user_id": *"\([^"]*\)".*/\1/p' | head -n 1)
+    if [ -n "$uid" ] \
+      && /var/bin/aginx-channels send weixin "$uid" "$1" >>"$LOG" 2>&1; then
+      log "battery: alert sent"
+    else
+      log "battery: alert FAILED (uid=${uid:-none}) — best-effort"
+    fi
+  else
+    log "battery: no channels face — $1"
+  fi
+}
+
+batt_check() {
+  [ -r "$BATT_PSY/capacity" ] || return 0
+  bp=$(cat "$BATT_PSY/capacity" 2>/dev/null)
+  [ -n "$bp" ] || return 0
+  bs=$(cat "$BATT_PSY/status" 2>/dev/null)
+  case "$bs" in
+    Discharging)
+      if [ "$batt_ext" != 0 ]; then
+        log "battery: on battery (${bp}%)"
+        batt_ext=0
+      fi
+      batt_stuck=0
+      # 迟滞：告警后回充到 CLEAR 以上才重新武装（中间带不重响）。
+      # 「充电无效」探针不置 batt_on——出 CLEAR 带也要撤注册表，否则文件过夜
+      # （redfin 10-12：05:54 写「充电无效 0%」，白天已 94% Discharging 仍挂着）。
+      if [ "$bp" -ge "$BATT_CLEAR" ]; then
+        if [ "$batt_on" -gt 0 ] || [ -f "$WARN_BATT" ]; then
+          batt_on=0
+          batt_write ''
+        fi
+      fi
+      if [ "$bp" -le "$BATT_WARN" ] && [ "$batt_on" -lt 1 ]; then
+        batt_on=1
+        batt_write "电量低 ${bp}% · 请接电源"
+        batt_send "${HOST} 电量低：${bp}%——请接上电源"
+      fi
+      if [ "$bp" -le "$BATT_CRIT" ] && [ "$batt_on" -lt 2 ]; then
+        batt_on=2
+        batt_send "${HOST} 电量危急：${bp}%——即将自动关机"
+      fi
+      ;;
+    *)  # Charging / Full / Not charging = 外电在
+      if [ "$batt_ext" != 1 ]; then
+        log "battery: on external power (${bp}%, ${bs:-unknown})"
+        batt_send "${HOST} 已接上电源（电量 ${bp}%）"
+        batt_ext=1
+      fi
+      if [ "$batt_on" -gt 0 ]; then
+        batt_on=0
+        batt_write ''
+      fi
+      # 充电无效探针：外电在而容量停在低电带 N 分钟不涨。有涨（再慢）
+      # 就重锚——慢充不是病；完全不动才是线材/头/口的病。
+      if [ "$bp" -le "$BATT_WARN" ]; then
+        if [ "$batt_stuck" -eq 0 ] || [ "$bp" -gt "$batt_anchor" ]; then
+          # 容量有涨 → 撤已落的「充电无效」（慢充不是病；原先只重锚计数）
+          if [ "$bp" -gt "$batt_anchor" ] && [ -f "$WARN_BATT" ]; then
+            batt_write ''
+          fi
+          batt_stuck=1
+          batt_anchor=$bp
+        else
+          batt_stuck=$((batt_stuck + 1))
+          if [ "$batt_stuck" -eq $((BATT_STUCK_MIN * 4)) ]; then
+            batt_write "充电无效 ${bp}% · 插电 ${BATT_STUCK_MIN} 分钟不涨"
+            batt_send "${HOST} 充电无效：已接电源但电量停在 ${bp}%（${BATT_STUCK_MIN} 分钟）——请检查线材/充电头"
+          fi
+        fi
+      else
+        batt_stuck=0
+        # 已出低电带：「充电无效」不走 batt_on，必须显式撤注册表
+        [ -f "$WARN_BATT" ] && batt_write ''
+      fi
+      ;;
+  esac
+}
+
+# 初值按现状定：重启/换装时已在充的不重播「已接上电源」（只报活边沿，
+# 免得每次 restart 都给主人发一条）。
+case "$(cat "$BATT_PSY/status" 2>/dev/null)" in
+  Discharging) batt_ext=0 ;;
+  *) [ -r "$BATT_PSY/capacity" ] && batt_ext=1 ;;
+esac
+
+# ---- CPU 看门狗腿（Mac grok 死转案, 2026-10-11）----
+CPUHOG_PCT=${CPUHOG_PCT:-90}
+CPUHOG_MIN=${CPUHOG_MIN:-5}
+CPU_PREV=/run/nw-cpu.snap
+CPU_STREAK=/run/nw-cpu.streak
+CPU_TS=/run/nw-cpu.ts
+WARN_CPU=$WARN_DIR/cpu
+
+cpu_snap() {  # 每进程一行：pid 累计CPU(ns) comm
+  for pd in /proc/[0-9]*; do
+    ns=$(cut -d' ' -f1 "$pd/schedstat" 2>/dev/null)
+    [ -n "$ns" ] || continue
+    echo "${pd#/proc/} $ns $(cat "$pd/comm" 2>/dev/null)"
+  done
+}
+
+cpu_send() {  # $1 文案；与电量腿同款 best-effort
+  if [ -x /var/bin/aginx-channels ]; then
+    uid=$(/var/bin/aginx-channels status 2>/dev/null \
+      | sed -n 's/.*"user_id": *"\([^"]*\)".*/\1/p' | head -n 1)
+    if [ -n "$uid" ] \
+      && /var/bin/aginx-channels send weixin "$uid" "$1" >>"$LOG" 2>&1; then
+      log "cpu: alert sent"
+    else
+      log "cpu: alert FAILED (uid=${uid:-none}) — best-effort"
+    fi
+  else
+    log "cpu: no channels face — $1"
+  fi
+}
+
+cpu_check() {
+  [ -r /proc/1/schedstat ] || return 0
+  cpu_snap >/run/nw-cpu.cur 2>/dev/null
+  [ -s /run/nw-cpu.cur ] || return 0
+  now=$(date +%s)
+  if [ ! -r "$CPU_PREV" ]; then
+    mv /run/nw-cpu.cur "$CPU_PREV"
+    echo "$now" >"$CPU_TS"
+    return 0
+  fi
+  # 窗口按实测耗时归一：idle 档 60s、heal 阻塞数分钟都不失真；
+  # 时钟回跳钳到 15s 下限（前跳只会让 lim 变大=漏报一窗，安全向）
+  prev_t=$(cat "$CPU_TS" 2>/dev/null)
+  case "$prev_t" in ''|*[!0-9]*) prev_t=$now ;; esac
+  echo "$now" >"$CPU_TS"
+  wms=$(( (now - prev_t) * 1000 ))
+  [ "$wms" -lt 15000 ] && wms=15000
+  lim=$(( wms * CPUHOG_PCT / 100 ))
+  fire_ms=$(( CPUHOG_MIN * 60000 ))
+  while read -r p n c; do eval "PV_$p=$n"; done <"$CPU_PREV"
+  : >/run/nw-cpu.new
+  while read -r pid ns comm; do
+    eval "pv=\$PV_$pid"
+    case "$pv" in ''|*[!0-9]*) continue ;; esac
+    d=$(((ns - pv) / 1000000))
+    [ "$d" -ge "$lim" ] || continue
+    # 连续烧核毫秒累计：同 pid 同 comm 才续计（pid 复用即重计）；
+    # 一窗不达标即清零——累计的是「连续」不是「总和」
+    line=$(grep "^$pid|" "$CPU_STREAK" 2>/dev/null | head -n 1)
+    oldms=0
+    if [ -n "$line" ]; then
+      om=$(echo "$line" | cut -d'|' -f2)
+      case "$om" in ''|*[!0-9]*) om=0 ;; esac
+      [ "$(echo "$line" | cut -d'|' -f3-)" = "$comm" ] && oldms=$om
+    fi
+    ms=$(( oldms + d ))
+    echo "$pid|$ms|$comm" >>/run/nw-cpu.new
+    if [ "$ms" -ge "$fire_ms" ] && [ "$oldms" -lt "$fire_ms" ]; then
+      printf '烧核 %s(%s) 已连续 %s 分钟\n' "$comm" "$pid" "$CPUHOG_MIN" \
+        >"$WARN_CPU.t" 2>/dev/null && mv "$WARN_CPU.t" "$WARN_CPU"
+      cpu_send "${HOST} CPU 告警：${comm}（pid ${pid}）连续烧核 ${CPUHOG_MIN} 分钟——请查"
+    fi
+  done </run/nw-cpu.cur
+  mv /run/nw-cpu.new "$CPU_STREAK"
+  mv /run/nw-cpu.cur "$CPU_PREV"
+  [ -s "$CPU_STREAK" ] || rm -f "$WARN_CPU"
+}
+
+# atomic tmp+rename like the face file (sole writer / poll reader)
+warn_net() { # $1 message; empty = clear
+  if [ -n "$1" ]; then
+    printf '%s\n' "$1" >"$WARN_NET.t" 2>/dev/null && mv "$WARN_NET.t" "$WARN_NET"
+  else
+    rm -f "$WARN_NET"
+  fi
+}
+
+log "net-watch start (pid $$)"
+mkdir -p "$WARN_DIR"
+n=0
+while [ $n -lt 600 ]; do
+  grep -q '^done' "$STATE" 2>/dev/null && break
+  sleep 1; n=$((n+1))
+done
+[ $n -lt 600 ] || log "no boot verdict after 600s — taking over anyway"
+
+idle=0
+fail=0
+wanfail=0
+while :; do
+  batt_check
+  cpu_check
+  # 有线兜底腿（X2 W2）：idle 门从「无 wifi.conf」放宽到「无 conf 且无
+  # 有线载波」——纯有线服务器板（无 wifi 面或未配网）也有守门人：探测/
+  # 红警/时钟自愈照跑，断链走 heal 的 udhcpc 分支。载波在而 conf 无=
+  # 非断网，与首启未配对的旧语义同源（idle 不落红警）。
+  if [ ! -f /etc/wifi.conf ] && ! wired_if >/dev/null; then
+    # nothing to rejoin against; the wizard will write the conf
+    [ $idle -eq 0 ] && { log "no /etc/wifi.conf — idling"; idle=1; }
+    sleep 60
+    continue
+  fi
+  idle=0
+  # busybox awk segfaults on this device (case file in net-bringup) —
+  # sed parse, or gw is always empty and we rejoin a healthy net every 45 s.
+  gw=$(ip route 2>/dev/null | sed -n 's/^default via \([0-9.][0-9.]*\) .*/\1/p' | head -n 1)
+  if [ -n "$gw" ] && ping -c1 -W3 "$gw" >/dev/null 2>&1; then
+    if ping -c1 -W3 "$WAN_PROBE" >/dev/null 2>&1; then
+      # 上游从断到通的沿：踢一次频道，丢掉挂死的长轮询（AP 侧 WAN
+      # 闪断不走 rejoin，所以 heal 里的 kick 覆盖不到这条路径）。
+      if [ "$wanfail" -gt 0 ]; then
+        log "wan recovered after $wanfail probes — kicking channels"
+        kick_channels
+      fi
+      wanfail=0
+      warn_net ''   # 链路+外网全通才撤红警；半恢复不算恢复
+      # 开机时钟自愈·稳态腿（#63）：网回来了而钟还是 1970/错尺——boot
+      # 时 net-bringup 的 ntpd 没赶上（离线启动、新机 offset 未落）在
+      # 这里补。钟真则一脉零开销；heal 会阻塞探测环至多 ~4 分钟
+      # （助手自带 12×(10s 闹钟+10s 歇) 有界预算），与 rejoin 的阻塞
+      # 纪律同。NTP 全灭但 ICMP 通的死局里每环重试一次，预算即节流。
+      if [ "$(date +%Y)" -lt 2026 ]; then
+        log "wan up but clock unsynced ($(date)) — ntp heal"
+        if /usr/libexec/aginx/net-timesync >>"$LOG" 2>&1; then
+          log "clock healed: $(date)"
+          echo "time ok late $(date +%Y-%m-%d)" >>"$STATE" 2>/dev/null
+        else
+          log "ntp heal failed — retrying next probe window"
+        fi
+      fi
+    else
+      wanfail=$(( wanfail + 1 ))
+      if [ $wanfail -eq 8 ]; then
+        log "wan down 8 probes (gateway ok) — ap-side, not rejoining"
+      fi
+      [ $wanfail -ge 8 ] && warn_net '无网络 · 上游断连'
+    fi
+  else
+    wanfail=0
+    fail=$((fail+1))
+    # 红警先于 rejoin 落（WARN_TRIP=2）：单次探测抖动不闪红，断链
+    # ~15-30s 上屏；rejoin 阻塞期间文件自然持留。
+    [ $fail -ge $WARN_TRIP ] && warn_net '无网络 · 自动重连中'
+    if [ $fail -ge $FAILS_TRIP ]; then
+      carrier=$(cat /sys/class/net/$IF/carrier 2>/dev/null || echo '?')
+      log "link lost ($fail probes, carrier=$carrier gw=${gw:-none}) — healing"
+      heal
+      fail=0
+    else
+      log "probe fail $fail/$FAILS_TRIP (gw=${gw:-none})"
+    fi
+  fi
+  # keep the log bounded (no logd here)
+  if [ "$(wc -c <"$LOG" 2>/dev/null || echo 0)" -gt 65536 ]; then
+    tail -n 300 "$LOG" >"$LOG.t" 2>/dev/null && mv "$LOG.t" "$LOG"
+  fi
+  sleep 15
+done

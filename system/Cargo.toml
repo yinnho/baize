@@ -1,0 +1,135 @@
+[workspace]
+resolver = "2"
+# 单 workspace（2026-09-24 结构刀①合并）。刀④-4（2026-10-02）引擎商品
+# 化拆迁：carrier/kernel/runtime/carrier-gateway 四 crate 删除（in-process
+# 引擎退役，对话真源=网关 agent://）；types/memory/clone/dup/lifecycle
+# 留役改嫁（aginx-mem/aginx-file/server 装卸链供养）。
+members = [
+    # ── OS 面（aginx-*）──
+    "crates/agio",
+    "crates/qr",
+    "crates/sign",
+    "crates/download",
+    "crates/update",
+    "crates/router",
+    "crates/server",
+    "crates/voice",
+    "crates/call",
+    "crates/channels",
+    "crates/wizard",
+    "crates/svc",
+    "crates/img",
+    "crates/term",
+    "crates/pkg",
+    "crates/testkit",
+    "crates/done",
+    "crates/secret",
+    "crates/pair",
+    "crates/hwd",
+    "crates/wificonf",
+    "crates/fg",
+    # ── 引擎遗留面（types/memory/clone/dup/lifecycle——人格真源与
+    #    格式层，④-5 接手 memory 线）──
+    "crates/types",
+    "crates/memory",
+    "crates/clone",
+    "crates/dup",
+    "crates/lifecycle",
+    "crates/aginx-file",
+    "crates/aginx-mem",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/yinnho/aginxos"
+authors = ["yinnho"]
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+bytes = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging / Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+sha1 = "0.10"
+# IDs
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+async-trait = "0.1"
+dirs = "6"
+# Security
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Testing
+rmp-serde = "1"
+tempfile = "3"
+
+# Storage / misc
+rusqlite = { version = "0.31", features = ["bundled"] }
+regex = "1"
+regex-lite = "0.1"
+lazy_static = "1.4"
+dashmap = "6"
+once_cell = "1"
+libc = "0.2"
+
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "deflate", "brotli", "blocking", "multipart", "cookies"] }
+base64 = "0.22"
+urlencoding = "2"
+flate2 = "1"
+tar = "0.4"
+hmac = "0.12"
+zeroize = { version = "1", features = ["derive"] }
+shlex = "1"
+
+# agent:// 客户端所在 crate（经网关路由外部 CLI 工具），版本对齐 agc
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+webpki-roots = "1"
+
+# Webhook inbound channel HTTP server (first server-side HTTP surface)
+axum = "0.8"
+
+# ilink channel deps
+md-5 = "0.10"
+roxmltree = "0.20"
+aes = "0.8"
+cbc = "0.1"
+
+# Internal crates (OS 面)
+agio = { path = "crates/agio" }
+
+# Internal crates（引擎遗留面：格式层/人格真源线）
+carrier-types = { path = "crates/types" }
+carrier-memory = { path = "crates/memory" }
+carrier-clone = { path = "crates/clone" }
+carrier-lifecycle = { path = "crates/lifecycle" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3

@@ -1,0 +1,730 @@
+#!/usr/bin/env bash
+# build-pkg.sh — aginx 体系包打包线（C8 蛋案）。
+#
+# usage: scripts/build-pkg.sh <name> [--push <serial>]
+#
+#   两裸包  aginx-secretd aginx-voice
+#                       — zigbuild musl 件 + pkgs/<name>/ 配方
+#   换芯树包  aginx-gateway
+#                       — 生态仓真 aginx（~/Documents/aginx/aginx，独立
+#                         项目专人开发，本仓只装配不仿制）原样 zigbuild
+#                         musl 静态，bin 改名落树（2026-09-27 刀1；v0.1.x
+#                         仿制品 crates/gateway 已于刀4 删源，收据 #412）
+#   两树包  aginx aginx-term
+#                       — 母体三件（router/server/runtime，刀3 合一）+
+#                         终端面板（term+字体，刀4 出镜像）
+#   工具双包  aginx-file aginx-mem
+#                       — 母体桥 spawn 的工具面 CLI（D13 改姓自 agf/
+#                         agmem，2026-09-26；缺包=母体文件/记忆工具死）
+#   三树包  aginx-asr aginx-tts aginx-ocr
+#                       — .local/device/redfin 冻结 bionic 件 + 模型一树
+#                         （exec=bin/ag-*，模型与整机烤机逐字节同源：asr
+#                          全树；tts=vits-melo 去 133B lfs 指针；ocr=
+#                          det/rec/dict 三件）
+#   刀F三包  aginx-qr aginx-pair aginx-update
+#                       — 出镜像走包（2026-09-12：L0 是 Linux，不预生成
+#                         二维码）：qr=jpeg 特性独立调用；pair=apply 面
+#                         --no-default-features + <2MB 绊网；update=母体
+#                         包 depends 锚。均不吃 opt-level=z（包 sha 与
+#                         manifest/镜像源耦合——刀E 的镜像线专属 env）
+#   上游树包  git
+#                       — Alpine v3.22 aarch64 apk 闭包 15 件（sha256 逐件
+#                         钉死）+ wrapper 面 bin/git（L0 刀C：https 传输
+#                         整树自持，apk 缓存 out/apk-cache 复用）
+#   上游树包  jq
+#                       — Alpine v3.22 jq+oniguruma+musl 闭包 3 apk（2026
+#                         -10-24，sha256 钉死，源走 tuna 镜像）+ wrapper
+#                         面 bin/jq：JSON 信封解码刀（relay JSONL/duphub
+#                         manifest），缓存同 out/apk-cache
+#   上游静态包  sqlite3
+#                       — sqlite.org amalgamation（zip 尺寸+sha256 钉死，
+#                         TOFU 于下载日）zig cc musl 全静态单件，face
+#                         /var/bin/sqlite3（一切皆CLI 裁决 2026-10-10；
+#                         研究库只读查询，缓存 out/sqlite-cache 复用）
+#   外源树包  aginxresearch
+#                       — 独立仓研究引擎（~/Documents/aginxresearch，
+#                         aginxbrowser 同级）musl 静态 CLI；v0.1.1 起
+#                         research-loop 常驻 wrapper 随树+[service] 单元
+#                         （#472 运维件归包）；实例=设备 /home/research
+#                         系统工作文件不进包（2026-10-08 首包）
+#   零编译运维包  morning-report
+#                       — 晨报 cron 腿归包（#472）：wrapper 壳脚本 +
+#                         [cron] 08:00 块（2026-10-10 首包 v0.1.0）
+#   可选电源包  aginx-fg
+#                       — redfin qpnp-qg 用户态 FG（crates/fg musl）；
+#                         unlock/hold/run + [service]；服务器板可不装
+#                         （2026-10-12 首包 v0.1.0）
+#   A/B 标记包  aginx-boot-ok
+#                       — 债 #346 刀（2026-10-26）：GPT attrs successful
+#                         标记器（crates/svc）+ 等 done ok wrapper，
+#                         oneshot_async 单元；enchilada 首用户（redfin
+#                         走烤内 rcS 路径不装，无 A/B 的板不装）
+#
+# 产物 out/pkgs/<name>-v<ver>-4pc.tar + .sha256（裸 hex），尾行打一行
+# manifest 片段（name url sha opt version [deps]）——L0 清单组装（刀4）
+# 直接收走。`--push <serial>` = adb push + `aginx-pkg install`（显式路径
+# = dev 免签通道）。镜像发布保持手工 scp（sync.sh 留服务器端）。
+#
+# MEMBER_MAX 闸：安装器 stream_member 单成员上限 512MiB（536870912B，
+# crates/pkg 的 MEMBER_MAX）。2026-10-24 提档 256→512MiB：Claude Code
+# 引擎件 270M Bun 单文件（自带 runtime，上游合法形态）。单成员
+# >480,000,000B 报警；≥512MiB 拒打。
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "${ROOT}"
+
+usage() {
+  echo "usage: scripts/build-pkg.sh <name> [--push <serial>]" >&2
+  exit 2
+}
+
+[ $# -ge 1 ] || usage
+PKG="$1"; shift
+SERIAL=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --push) [ $# -ge 2 ] || usage; SERIAL="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
+
+RECIPE="pkgs/${PKG}"
+[ -f "${RECIPE}/pkg.toml" ] || { echo "FATAL: no recipe ${RECIPE}/pkg.toml" >&2; exit 1; }
+[ -f "${RECIPE}/SKILL.md" ] || { echo "FATAL: no ${RECIPE}/SKILL.md（四件套铁律）" >&2; exit 1; }
+
+# pkg.toml 是自家扁平格式，值全带引号无内嵌引号——sed 取串够用
+toml_str() {
+  sed -n "s/^$1 *= *\"\([^\"]*\)\"/\1/p" "${RECIPE}/pkg.toml" | sed -n '1p'
+}
+
+NAME="$(toml_str name)"
+VER="$(toml_str version)"
+URL="$(toml_str url)"
+DEPS="$(toml_str depends)"
+[ "${NAME}" = "${PKG}" ] || { echo "FATAL: pkg.toml name='${NAME}' != '${PKG}'" >&2; exit 1; }
+[ -n "${VER}" ] || { echo "FATAL: ${RECIPE}/pkg.toml 缺 version" >&2; exit 1; }
+[ -n "${URL}" ] || { echo "FATAL: ${RECIPE}/pkg.toml 缺 url（C10 EGG 清单组装要用）" >&2; exit 1; }
+# url 漂移闸（#450：version 已 bump 而 url 残留旧版本路径，首个消费者
+# 在 opt-in sha 不合时才逮住——出包即拦）。
+case "${URL}" in
+  */v${VER}/*) ;;
+  *) echo "FATAL: ${RECIPE}/pkg.toml url 路径不含 /v${VER}/（version 与 url 漂移）: ${URL}" >&2; exit 1 ;;
+esac
+
+TARGET_DIR="${ROOT}/target/aarch64-unknown-linux-musl/release"
+VOICE="${ROOT}/.local/device/redfin/voice"
+OCR="${ROOT}/.local/device/redfin/ocr"
+OUT="${ROOT}/out/pkgs"
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/aginx-pkg-${PKG}.XXXXXX")"
+trap 'rm -rf "${STAGE}"' EXIT
+mkdir -p "${OUT}"
+TARNAME="${PKG}-v${VER}-4pc.tar"
+
+case "${PKG}" in
+  aginx-secretd | aginx-voice)
+    # crate 名≠包名的唯一例外：secretd 二进制住在 aginx-secret crate（双 bin）
+    CRATE="${PKG}"
+    [ "${PKG}" = "aginx-secretd" ] && CRATE="aginx-secret"
+    echo "==> zigbuild ${PKG}（musl，缓存则秒过）"
+    (cd "${ROOT}" && cargo zigbuild --release --target aarch64-unknown-linux-musl -p "${CRATE}")
+    mkdir -p "${STAGE}/bin"
+    install -m 755 "${TARGET_DIR}/${PKG}" "${STAGE}/bin/${PKG}"
+    MEMBERS="bin pkg.toml SKILL.md"
+    ;;
+  aginx-call)
+    # M48 刀5a（2026-09-28）：opus-media 折 audiopus_sys——CMake 4 拒
+    # audiopus_sys-0.2.2 的 cmake_minimum_required<3.5，须 env 钉政策
+    # 版本（刀2 收据配方）。产物 30M 级静态，strip 控包体。exec 面=
+    # files/bin（aginx-file 同形；裸 bin/ 成员与 exec 键互斥）。
+    CRATE="aginx-call"
+    echo "==> zigbuild ${PKG}（musl+opus-media，CMake 政策钉 3.5）"
+    (cd "${ROOT}" && CMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      cargo zigbuild --release --target aarch64-unknown-linux-musl \
+      -p "${CRATE}" --features opus-media)
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${TARGET_DIR}/${PKG}" "${STAGE}/files/bin/${PKG}"
+    strip "${STAGE}/files/bin/${PKG}" 2>/dev/null || true
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginx-gateway)
+    # 换芯树包（刀1，2026-09-27）：真身=生态仓 aginx——四独立项目之一，
+    # 只构建不改码。out-of-tree CARGO_TARGET_DIR 保证生态仓工作树零
+    # 改动，--locked 钉死依赖闭包。生态 bin 名 aginx，落包改名
+    # aginx-gateway：真身居 pkgfiles，面 /var/bin symlink + .aginxmd
+    # （安装器自动生成），[service] cmd 直指真身。遇编译问题写需求
+    # 文档（docs/REQ-*.md）给专人，不在生态仓动手。
+    ECO="${AGINX_ECO:-$HOME/Documents/aginx/aginx}"
+    ECO_BUILD="${ROOT}/out/eco-aginx-build"
+    [ -f "${ECO}/Cargo.toml" ] || { echo "FATAL: 生态仓不在 ${ECO}（AGINX_ECO 可改指）" >&2; exit 1; }
+    echo "==> zigbuild 生态 aginx（${ECO}，musl，缓存则秒过）"
+    (cd "${ECO}" && CARGO_TARGET_DIR="${ECO_BUILD}" \
+      cargo zigbuild --release --locked --target aarch64-unknown-linux-musl)
+    ECO_BIN="${ECO_BUILD}/aarch64-unknown-linux-musl/release/aginx"
+    [ -x "${ECO_BIN}" ] || { echo "FATAL: ${ECO_BIN} 未产出" >&2; exit 1; }
+    # musl 静态自证（刀1 验收门）：非静态=zigbuild 链了 glibc，上机必炸
+    file "${ECO_BIN}" | grep -q "statically linked" \
+      || { echo "FATAL: 生态 aginx 非 musl 静态（$(file "${ECO_BIN}")）" >&2; exit 1; }
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${ECO_BIN}" "${STAGE}/files/bin/aginx-gateway"
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginx)
+    # 前台树包（刀④-4 裁形，2026-10-02）：两件——aginx（router face）
+    # + aginx-server（UDS 面：list/status/install/remove + 系统直通条目）。
+    # 第三件 aginx-carrier 随引擎商品化拆迁退役（#68 刀④；send/create
+    # 面退役，对话走网关 agent://）。exec=bin/aginx
+    # → /var/bin/aginx symlink 面；[service] cmd 指 pkgfiles 真身。
+    echo "==> zigbuild 前台两件（musl，缓存则秒过）"
+    (cd "${ROOT}" && cargo zigbuild --release --target aarch64-unknown-linux-musl \
+      -p aginx-router -p aginx-server)
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${TARGET_DIR}/aginx" "${TARGET_DIR}/aginx-server" \
+      "${STAGE}/files/bin/"
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginx-term)
+    # 终端树包（刀4 出镜像）：term + CJK 字体一树。字体真源是 rootfs
+    # 配方里的冻结资产（M38a，同 n5-qr.jpg 先例——文件不搬家）。
+    echo "==> zigbuild aginx-term（musl，缓存则秒过）"
+    (cd "${ROOT}" && cargo zigbuild --release --target aarch64-unknown-linux-musl \
+      -p aginx-term)
+    mkdir -p "${STAGE}/files/bin" "${STAGE}/files/share/fonts"
+    install -m 755 "${TARGET_DIR}/aginx-term" "${STAGE}/files/bin/aginx-term"
+    install -m 644 "${ROOT}/rootfs/usr/share/fonts/agterm-cjk.otf" \
+      "${STAGE}/files/share/fonts/agterm-cjk.otf"
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginx-qr)
+    # 刀F（2026-09-12）出镜像走包：voice/term 的取景扫码 spawn 本面。
+    # --features aginx-qr/jpeg 必须独立调用——特性选择是调用级旗标，
+    # 并进共享调用会把 quircs+aginx-img 织进任何依赖 aginx-qr 的 crate
+    # （N5② 特性陷阱的出生地，当年受害者 aginx-voice）。解码器必须
+    # 是自己一个进程。
+    echo "==> zigbuild aginx-qr（musl jpeg 特性，缓存则秒过）"
+    (cd "${ROOT}" && cargo zigbuild --release --target aarch64-unknown-linux-musl \
+      -p aginx-qr --features aginx-qr/jpeg)
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${TARGET_DIR}/aginx-qr" "${STAGE}/files/bin/aginx-qr"
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginx-pair)
+    # 刀F 出镜像走包：设备面只要 apply（stdin payload，C4 voice/term
+    # 依赖）。--no-default-features 是调用级旗标——并进共享调用会把
+    # mint 的 qrcodegen/jpeg-encoder 连带 aginx-qr/jpeg 的 quircs+
+    # aginx-img 织进其它包；铸码在 host 跑 default 特性。
+    # <2MB 绊网同律：尺寸变化=feature 折叠事故。
+    echo "==> zigbuild aginx-pair（musl apply 面，缓存则秒过）"
+    (cd "${ROOT}" && cargo zigbuild --release --target aarch64-unknown-linux-musl \
+      -p aginx-pair --no-default-features)
+    PAIR_SZ="$(stat -f%z "${TARGET_DIR}/aginx-pair")"
+    [ "${PAIR_SZ}" -lt 2097152 ] \
+      || { echo "FATAL: aginx-pair is ${PAIR_SZ}B (≥2MiB) — mint feature leaked into the device build" >&2; exit 1; }
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${TARGET_DIR}/aginx-pair" "${STAGE}/files/bin/aginx-pair"
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginx-update)
+    # 刀F 出镜像走包：母体包 depends 锚住（装 aginx 自动带）；裸箱
+    # 升级=重刷。BOOT_OK_BIN/DOWNLOAD_BIN 都指 L0 直装件，包体零改。
+    echo "==> zigbuild aginx-update（musl，缓存则秒过）"
+    (cd "${ROOT}" && cargo zigbuild --release --target aarch64-unknown-linux-musl -p aginx-update)
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${TARGET_DIR}/aginx-update" "${STAGE}/files/bin/aginx-update"
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginx-file | aginx-mem)
+    # 工具面双包（D13 改姓 2026-09-26，原 agf/agmem）：母体桥 spawn
+    # `aginx-file|aginx-mem tool <name>`（stdin=JSON 含 _ctx，stdout=D1
+    # 信封）——缺包=母体文件/记忆工具整线死（09-26 晨报根因）。装包
+    # 自动生成 .aginxmd，/var/bin 真身遮住镜像 /usr/bin 桥壳。
+    echo "==> zigbuild ${PKG}（musl，缓存则秒过）"
+    (cd "${ROOT}" && cargo zigbuild --release --target aarch64-unknown-linux-musl -p "${PKG}")
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${TARGET_DIR}/${PKG}" "${STAGE}/files/bin/${PKG}"
+    # v0.2.0 日循环腿：wrapper 随树（[cron] 23:47 线指 pkgfiles 真身）。
+    if [ "${PKG}" = "aginx-mem" ]; then
+      mkdir -p "${STAGE}/files/libexec"
+      install -m 755 "${ROOT}/pkgs/aginx-mem/files/libexec/day-review.sh" \
+        "${STAGE}/files/libexec/day-review.sh"
+    fi
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginx-channels)
+    # 频道体系包（#69 改形：channels 唯一家，weixin=第一腿不是包名）：
+    # 守护+CLI 一件双面，flat bin（secretd 同形——/var/bin 面）。
+    # zigbuild 包名 channels，出件二进制名 aginx-channels。
+    # 数据与绑定不进包：全部住 /home/channels/<名>/（DESIGN.md §四）。
+    echo "==> zigbuild aginx-channels（musl，缓存则秒过）"
+    (cd "${ROOT}" && cargo zigbuild --release --target aarch64-unknown-linux-musl -p channels)
+    mkdir -p "${STAGE}/bin"
+    install -m 755 "${TARGET_DIR}/aginx-channels" "${STAGE}/bin/aginx-channels"
+    MEMBERS="bin pkg.toml SKILL.md"
+    ;;
+  aginx-gateway-local)
+    # 本机 ACP 口（#68 ②b）：零编译案——壳脚本（带 D13 inline 头）+
+    # 出厂配置缺省，真身 exec aginx-gateway 包的二进制（另一实例）。
+    # v0.1.2 起 exec 树形（#69）：壳住 files/bin/（/var/bin=symlink 面），
+    # files/ 全树提交 pkgfiles——缺省 etc/ 同树可达（flat bin 形状下
+    # files/ 被安装器静默丢弃，redfin 现抓）。壳首启拷
+    # /etc/aginx/gateway-local.toml（已存在不覆写）。
+    mkdir -p "${STAGE}/files/bin" "${STAGE}/files/etc"
+    install -m 755 "${ROOT}/pkgs/aginx-gateway-local/files/bin/aginx-gateway-local" \
+      "${STAGE}/files/bin/aginx-gateway-local"
+    install -m 644 "${ROOT}/pkgs/aginx-gateway-local/files/etc/gateway-local.toml" \
+      "${STAGE}/files/etc/gateway-local.toml"
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginx-asr)
+    test -x "${VOICE}/bin/ag-asr" || { echo "FATAL: missing ${VOICE}/bin/ag-asr — see devices/redfin/boot/assets.md" >&2; exit 1; }
+    test -s "${VOICE}/models/asr/model.int8.onnx" || { echo "FATAL: missing asr models" >&2; exit 1; }
+    mkdir -p "${STAGE}/files/bin" "${STAGE}/files/models"
+    install -m 755 "${VOICE}/bin/ag-asr" "${STAGE}/files/bin/ag-asr"
+    cp -R "${VOICE}/models/asr" "${STAGE}/files/models/asr"
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginx-tts)
+    test -x "${VOICE}/bin/ag-tts" || { echo "FATAL: missing ${VOICE}/bin/ag-tts" >&2; exit 1; }
+    test -s "${VOICE}/models/tts/vits-melo-tts-zh_en/model.onnx" || { echo "FATAL: missing tts models" >&2; exit 1; }
+    mkdir -p "${STAGE}/files/bin" "${STAGE}/files/models/tts"
+    install -m 755 "${VOICE}/bin/ag-tts" "${STAGE}/files/bin/ag-tts"
+    cp -R "${VOICE}/models/tts/vits-melo-tts-zh_en" "${STAGE}/files/models/tts/vits-melo-tts-zh_en"
+    # 与整机烤机同律（build-rootfs.sh 同段）：tarball 的 model.int8.onnx
+    # 是 133B git-lfs 指针（M42e 收据），真权重是 fp32 model.onnx
+    rm -f "${STAGE}/files/models/tts/vits-melo-tts-zh_en/model.int8.onnx"
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginx-ocr)
+    test -x "${OCR}/bin/ag-ocr" || { echo "FATAL: missing ${OCR}/bin/ag-ocr" >&2; exit 1; }
+    test -s "${OCR}/models/det.onnx" && test -s "${OCR}/models/rec.onnx" \
+      && test -s "${OCR}/models/dict.txt" || { echo "FATAL: missing ocr models" >&2; exit 1; }
+    mkdir -p "${STAGE}/files/bin" "${STAGE}/files/models/ocr"
+    install -m 755 "${OCR}/bin/ag-ocr" "${STAGE}/files/bin/ag-ocr"
+    cp "${OCR}/models/det.onnx" "${OCR}/models/rec.onnx" \
+      "${OCR}/models/dict.txt" "${STAGE}/files/models/ocr/"
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  git)
+    # 上游树包（L0 缺口刀C，2026-09-12）：Alpine v3.22 main/aarch64 依赖
+    # 闭包 15 apk，sha256 逐件钉死（TOFU 于下载日——APKINDEX 无 apk 文件
+    # 哈希，钉表即此）。缓存 out/apk-cache 复用（sha 合则不拉）。apk 内
+    # 全是目录正确的相对 symlink（git-core 命令族 -> ../../bin/git、
+    # lib*.so.N -> 实文件），安装器按 symlink 原样重建（lib.rs :428-439
+    # 收 tree_symlinks，文件成员全部落地后才建链——相对目标必在）。
+    # ca-certificates-bundle 故意不在闭包：libcurl 编译期默认 CA 路径
+    # /etc/ssl/certs/ca-certificates.crt 镜像已烤入（M12，L0 继承）。
+    APK_DIR="${ROOT}/out/apk-cache"
+    ALPINE_BASE="https://dl-cdn.alpinelinux.org/alpine/v3.22/main/aarch64"
+    GIT_APKS="
+      musl-1.2.5-r12:ac281d1e7f9e9c447c51e309317b975f48be6edaf3ab91ae73b959cf86703782
+      git-2.49.1-r0:9d27f0e5e57b234e6d6a8a2b635ba82286e1dd441ea26c280aba4c8e416b4f60
+      zlib-1.3.2-r0:7a39a917e4dab3c7a45537210ee5b5f17bf75f5e7777809a20cddd0afe074187
+      pcre2-10.46-r0:62fdc4a3d6b48ca211cf6480c5da55664b489ec2b192ca8942e5b1d60ebe9496
+      libexpat-2.8.4-r0:a67a6a5e55a9e2716197d5bd4d22d980a41d611166d8bcdd71acb69286eaadee
+      libcurl-8.14.1-r3:a811d6f0370383461ed4993434f84b812f29a48009332f517d8a373613797532
+      zstd-libs-1.5.7-r0:a0e92d2225941a514eb0b2325b137fe6444ef9171627aae8129b74a6ad934ac4
+      libssl3-3.5.8-r0:2b175c982f9ff9a80fc88fa587f6db0ae1c58eef4b3f7fe69e8f066be9ff1090
+      libcrypto3-3.5.8-r0:094c5816644ade889f74387e8d91aad89dc9a05eda150494e3f91b80ffc15460
+      libpsl-0.21.5-r3:b9f7270cb2980876f57360f38ca11093aefaf7f5eb4b777dfbc4e5738449e438
+      libunistring-1.3-r0:6b6631284b25fa28bb9e63f9d423145e96d0f7aeb55a592f5cd5d54fb39380f7
+      libidn2-2.3.7-r0:9ddc248988707da96752077d05bacbda751d46cc1f7aa1460b3a40c4fbf66a6e
+      nghttp2-libs-1.69.0-r0:19db967a36f1e041e96240484d94063354f5c837e36d50daa017c2e96393a5e7
+      c-ares-1.34.8-r0:e293f056615fff3cf6050a423c090179daf48516317912daf1e133a1095a2f65
+      brotli-libs-1.1.0-r2:b05f9d2839bb89f28325890ffbd7d94025af6b301344ae0255f08617a6036c65
+    "
+    mkdir -p "${APK_DIR}" "${STAGE}/files"
+    for pair in ${GIT_APKS}; do
+      apk="${pair%%:*}"; want="${pair##*:}"
+      f="${APK_DIR}/${apk}.apk"
+      if [ ! -s "${f}" ] || [ "$(shasum -a 256 "${f}" | cut -d' ' -f1)" != "${want}" ]; then
+        echo "  fetch ${apk}"
+        curl -fsSL -o "${f}" "${ALPINE_BASE}/${apk}.apk" \
+          || { echo "FATAL: fetch ${apk} 失败" >&2; exit 1; }
+      fi
+      got="$(shasum -a 256 "${f}" | cut -d' ' -f1)"
+      [ "${got}" = "${want}" ] \
+        || { echo "FATAL: ${apk} sha256 不符（钉 ${want} 得 ${got}）" >&2; exit 1; }
+      tar -xzf "${f}" -C "${STAGE}/files"
+    done
+    # apk 家务件 + 赘重裁掉：man/doc/locale、openssl 引擎/模块目录（TLS
+    # 默认 provider 内建于 libcrypto）、libcrypto 带的 etc/ssl 配置副本
+    # （libcurl 走镜像烤入的绝对 CA 路径，树内副本无人读）。
+    rm -f "${STAGE}/files/.PKGINFO" "${STAGE}/files"/.SIGN.* \
+          "${STAGE}/files"/.pre-* "${STAGE}/files"/.post-* "${STAGE}/files"/.trigger*
+    rm -rf "${STAGE}/files"/usr/share/man "${STAGE}/files"/usr/share/doc \
+           "${STAGE}/files"/usr/share/locale "${STAGE}/files"/etc \
+           "${STAGE}/files"/usr/lib/engines-3 "${STAGE}/files"/usr/lib/ossl-modules
+    # wrapper 面（/lib loader 首跑自链 + GIT_EXEC_PATH/TEMPLATE +
+    # LD_LIBRARY_PATH——细节见 pkgs/git/bin/git 头注）。apk 树只有
+    # usr/bin，bin/ 是 wrapper 专属层。
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${RECIPE}/bin/git" "${STAGE}/files/bin/git"
+    # 模板自持：Alpine git apk 只发一个空 templates 目录（sample hooks
+    # 一概不发），空目录过不了安装器（只为文件成员建目录）——上机腿
+    # 实测每次 clone 打「templates not found」。配方自带官方模板的
+    # 非噪音子集（description + info/exclude），有文件成员目录才落地。
+    mkdir -p "${STAGE}/files/usr/share/git-core/templates/info"
+    install -m 644 "${RECIPE}/templates/description" \
+      "${STAGE}/files/usr/share/git-core/templates/description"
+    install -m 644 "${RECIPE}/templates/info/exclude" \
+      "${STAGE}/files/usr/share/git-core/templates/info/exclude"
+    find "${STAGE}/files" -type d -exec chmod 755 {} +
+    # 闭包钉死门：本体 + loader + git-core multicall 面 + 模板 + 全部
+    # DT_NEEDED soname（闭包声明与树内容不一致时这里现形）
+    test -x "${STAGE}/files/usr/bin/git" || { echo "FATAL: 树里无 usr/bin/git" >&2; exit 1; }
+    test -f "${STAGE}/files/lib/ld-musl-aarch64.so.1" || { echo "FATAL: 树里无 musl loader" >&2; exit 1; }
+    test -e "${STAGE}/files/usr/libexec/git-core/git-remote-https" \
+      || { echo "FATAL: 树里无 git-remote-https（https 传输面）" >&2; exit 1; }
+    test -f "${STAGE}/files/usr/share/git-core/templates/description" \
+      || { echo "FATAL: 树里无 git 模板（init/clone 要用）" >&2; exit 1; }
+    for so in libc.musl-aarch64.so.1 libcurl.so.4 libexpat.so.1 libpcre2-8.so.0 \
+              libz.so.1 libzstd.so.1 libbrotlicommon.so.1 libbrotlidec.so.1 \
+              libcares.so.2 libcrypto.so.3 libssl.so.3 libidn2.so.0 \
+              libnghttp2.so.14 libpsl.so.5 libunistring.so.5; do
+      find "${STAGE}/files/lib" "${STAGE}/files/usr/lib" -maxdepth 1 -name "${so}" | grep -q . \
+        || { echo "FATAL: 闭包缺 soname ${so}" >&2; exit 1; }
+    done
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  jq)
+    # 上游树包（2026-10-24，dev CLI 补齐四件之二）：Alpine v3.22
+    # main/aarch64 闭包 3 apk（jq+oniguruma+musl），sha256 逐件钉死
+    # （TOFU 于下载日，同 git 钉表）。musl r13 与 git 包钉的 r12 同为
+    # 1.2.5（stable 分支滚动 rev），loader 自链先到先得互不回抢。
+    # 源走 tuna 镜像：镜像文件与 dl-cdn 同源同 sha，dl-cdn 当夜连
+    # 不通（curl 28），缓存命中时不碰网。闭包最小：jq 树=usr/bin/jq
+    # +usr/lib/libjq.so.1*，oniguruma=usr/lib/libonig.so.5*，musl=
+    # loader+libc——无 man/doc/locale 可裁，只剥 apk 家务件。
+    APK_DIR="${ROOT}/out/apk-cache"
+    JQ_BASE="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/main/aarch64"
+    JQ_APKS="
+      jq-1.8.2-r0:20e3b54393eecb2ee3c41a2f54e2401fadadf493b4de58a69fa09fa654c37ab5
+      oniguruma-6.9.10-r0:486a30ba898571f8f391958494ef3982494dffbc56d368d477293c5159c5c192
+      musl-1.2.5-r13:d616c430bcbe0bf452b7f6ea2669f2cad14e85644a7599f4f495115d021742ef
+    "
+    mkdir -p "${APK_DIR}" "${STAGE}/files"
+    for pair in ${JQ_APKS}; do
+      apk="${pair%%:*}"; want="${pair##*:}"
+      f="${APK_DIR}/${apk}.apk"
+      if [ ! -s "${f}" ] || [ "$(shasum -a 256 "${f}" | cut -d' ' -f1)" != "${want}" ]; then
+        echo "  fetch ${apk}"
+        curl -fsSL -o "${f}" "${JQ_BASE}/${apk}.apk" \
+          || { echo "FATAL: fetch ${apk} 失败" >&2; exit 1; }
+      fi
+      got="$(shasum -a 256 "${f}" | cut -d' ' -f1)"
+      [ "${got}" = "${want}" ] \
+        || { echo "FATAL: ${apk} sha256 不符（钉 ${want} 得 ${got}）" >&2; exit 1; }
+      tar -xzf "${f}" -C "${STAGE}/files"
+    done
+    rm -f "${STAGE}/files/.PKGINFO" "${STAGE}/files"/.SIGN.* \
+          "${STAGE}/files"/.pre-* "${STAGE}/files"/.post-* "${STAGE}/files"/.trigger*
+    find "${STAGE}/files" -type d -exec chmod 755 {} +
+    # wrapper 面（细节见 pkgs/jq/bin/jq 头注）
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${RECIPE}/bin/jq" "${STAGE}/files/bin/jq"
+    # 闭包钉死门：本体 + loader + DT_NEEDED soname
+    test -x "${STAGE}/files/usr/bin/jq" || { echo "FATAL: 树里无 usr/bin/jq" >&2; exit 1; }
+    test -f "${STAGE}/files/lib/ld-musl-aarch64.so.1" || { echo "FATAL: 树里无 musl loader" >&2; exit 1; }
+    for so in libjq.so.1 libonig.so.5; do
+      find "${STAGE}/files/lib" "${STAGE}/files/usr/lib" -maxdepth 1 -name "${so}" | grep -q . \
+        || { echo "FATAL: 闭包缺 soname ${so}" >&2; exit 1; }
+    done
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  bash)
+    # 上游树包（2026-10-24，dev CLI 第五件）：Alpine v3.22 main/aarch64
+    # 闭包 4 apk（bash+readline+ncurses-libs+ncurses-terminfo-base），
+    # sha256 逐件钉死（TOFU 于下载日，同 jq 钉表工艺）。musl r13 与
+    # git/jq/claude 同钉同缓存（loader 自链先到先得）。存在理由：claude
+    # 引擎（Claude Code）的 Bash 工具腿在 Linux 上硬找 bash（busybox
+    # 无 bash applet），claude manifest 行 deps=bash 随闭包装入。
+    # 闭包 4 apk（bash+readline+libncursesw+musl；terminfo 库走
+    # ncurses-terminfo-base）。ncurses-libs 是空壳 meta 包（四子库
+    # 拆包），readline 只需 libncursesw.so.6。
+    APK_DIR="${ROOT}/out/apk-cache"
+    BASH_BASE="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/main/aarch64"
+    BASH_APKS="
+      bash-5.2.37-r0:411e1fec2dccd603bc9f23586f7b8df2211613ece49b20c71c17412ab2667c44
+      readline-8.2.13-r1:334af29dbf6b5a71a87af4d6a58e2967a8f711a51d00093de0e1498daf83ceb2
+      libncursesw-6.5_p20250503-r0:419b375e8a4345e7172b1f0f3a3c57db61374f5408cdb875d9e860bd4c243aca
+      ncurses-terminfo-base-6.5_p20250503-r0:3d37403e0b5ab9eb0c1ce269444e4a385faec9fe6af452c1c6956806b13d2bd6
+      musl-1.2.5-r13:d616c430bcbe0bf452b7f6ea2669f2cad14e85644a7599f4f495115d021742ef
+    "
+    mkdir -p "${APK_DIR}" "${STAGE}/files"
+    for pair in ${BASH_APKS}; do
+      apk="${pair%%:*}"; want="${pair##*:}"
+      f="${APK_DIR}/${apk}.apk"
+      if [ ! -s "${f}" ] || [ "$(shasum -a 256 "${f}" | cut -d' ' -f1)" != "${want}" ]; then
+        echo "  fetch ${apk}"
+        curl -fsSL -o "${f}" "${BASH_BASE}/${apk}.apk" \
+          || { echo "FATAL: fetch ${apk} 失败" >&2; exit 1; }
+      fi
+      got="$(shasum -a 256 "${f}" | cut -d' ' -f1)"
+      [ "${got}" = "${want}" ] \
+        || { echo "FATAL: ${apk} sha256 不符（钉 ${want} 得 ${got}）" >&2; exit 1; }
+      tar -xzf "${f}" -C "${STAGE}/files"
+    done
+    rm -f "${STAGE}/files/.PKGINFO" "${STAGE}/files"/.SIGN.* \
+          "${STAGE}/files"/.pre-* "${STAGE}/files"/.post-* "${STAGE}/files"/.trigger*
+    find "${STAGE}/files" -type d -exec chmod 755 {} +
+    # apk 把真身放 bin/bash（v3.22 bash 未 usr-merge）——先挪 usr/bin
+    #（家规：真身 usr/bin、wrapper 面 bin/，claude 同布局），再铺 wrapper。
+    mkdir -p "${STAGE}/files/usr/bin"
+    [ -f "${STAGE}/files/bin/bash" ] && mv "${STAGE}/files/bin/bash" "${STAGE}/files/usr/bin/bash"
+    # wrapper 面（细节见 pkgs/bash/bin/bash 头注）
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${RECIPE}/bin/bash" "${STAGE}/files/bin/bash"
+    # 闭包钉死门：本体 + loader + DT_NEEDED soname
+    test -x "${STAGE}/files/usr/bin/bash" || { echo "FATAL: 树里无 usr/bin/bash" >&2; exit 1; }
+    test -f "${STAGE}/files/lib/ld-musl-aarch64.so.1" || { echo "FATAL: 树里无 musl loader" >&2; exit 1; }
+    for so in libreadline.so.8 libncursesw.so.6; do
+      find "${STAGE}/files/lib" "${STAGE}/files/usr/lib" -maxdepth 1 -name "${so}" | grep -q . \
+        || { echo "FATAL: 闭包缺 soname ${so}" >&2; exit 1; }
+    done
+    test -d "${STAGE}/files/etc/terminfo" || { echo "FATAL: 树里无 terminfo" >&2; exit 1; }
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  claude)
+    # 引擎树包（2026-10-24，Claude Code 上机）：官方 npm 平台子包
+    # @anthropic-ai/claude-code-linux-arm64-musl（Bun 编译原生单文件，
+    # musl arm64，自带 runtime 不需要 Node——npm 主包只是 wrapper，本
+    # 体在平台子包）。tgz sha256 钉死 TOFU；npm integrity sha512 交叉
+    # 源=W0h8eJdDUmnCAtMSthCBC8AeB0nmnBhueVD9XPyPOxC8Sf+4zLy6k0hbAC+S
+    # tonX80M0f7YVzHaQ9VXtNSxlWQ==（base64，registry 元数据）。
+    # musl r13 与 git/jq 同钉同缓存（loader 自链先到先得）。
+    # 大件：本体 270M，出件 tar ~130M——镜像上架/设备 df 前置检查。
+    APK_DIR="${ROOT}/out/apk-cache"
+    NPM_DIR="${ROOT}/out/npm-cache"
+    CLAUDE_TGZ_SHA=2fa33a03490fcb23faefdb136b4a7f12692371441e6c5a70546d275c679813b9
+    CLAUDE_BIN_SHA=adfd1f0ef12a3bcafa66e33491fc3e4204e41aeb4a7305ffc311c16c26793825
+    CLAUDE_URL="https://registry.npmjs.org/@anthropic-ai/claude-code-linux-arm64-musl/-/claude-code-linux-arm64-musl-2.1.310.tgz"
+    MUSL_APK_SHA=d616c430bcbe0bf452b7f6ea2669f2cad14e85644a7599f4f495115d021742ef
+    mkdir -p "${NPM_DIR}" "${APK_DIR}" "${STAGE}/files"
+    f="${NPM_DIR}/claude-2.1.310-musl-arm64.tgz"
+    if [ ! -s "${f}" ] || [ "$(shasum -a 256 "${f}" | cut -d' ' -f1)" != "${CLAUDE_TGZ_SHA}" ]; then
+      echo "  fetch claude tgz (130M)"
+      curl -fsSL -o "${f}" "${CLAUDE_URL}" \
+        || { echo "FATAL: fetch claude tgz 失败" >&2; exit 1; }
+    fi
+    [ "$(shasum -a 256 "${f}" | cut -d' ' -f1)" = "${CLAUDE_TGZ_SHA}" ] \
+      || { echo "FATAL: claude tgz sha 不符" >&2; exit 1; }
+    mkdir -p "${STAGE}/npm"
+    tar -xzf "${f}" -C "${STAGE}/npm"
+    [ "$(shasum -a 256 "${STAGE}/npm/package/claude" | cut -d' ' -f1)" = "${CLAUDE_BIN_SHA}" ] \
+      || { echo "FATAL: claude 本体 sha 不符" >&2; exit 1; }
+    file "${STAGE}/npm/package/claude" | grep -q 'ld-musl-aarch64' \
+      || { echo "FATAL: claude 本体非 musl（interpreter 不对）" >&2; exit 1; }
+    mkdir -p "${STAGE}/files/usr/bin"
+    install -m 755 "${STAGE}/npm/package/claude" "${STAGE}/files/usr/bin/claude"
+    a="${APK_DIR}/musl-1.2.5-r13.apk"
+    if [ ! -s "${a}" ]; then
+      echo "  fetch musl apk"
+      curl -fsSL -o "${a}" "https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/main/aarch64/musl-1.2.5-r13.apk" \
+        || { echo "FATAL: fetch musl 失败" >&2; exit 1; }
+    fi
+    [ "$(shasum -a 256 "${a}" | cut -d' ' -f1)" = "${MUSL_APK_SHA}" ] \
+      || { echo "FATAL: musl apk sha 不符" >&2; exit 1; }
+    tar -xzf "${a}" -C "${STAGE}/files" lib
+    # wrapper 面（细节见 pkgs/claude/bin/claude 头注）
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${RECIPE}/bin/claude" "${STAGE}/files/bin/claude"
+    # 闭包钉死门：本体 + musl loader + libc
+    test -x "${STAGE}/files/usr/bin/claude" || { echo "FATAL: 树里无 usr/bin/claude" >&2; exit 1; }
+    test -f "${STAGE}/files/lib/ld-musl-aarch64.so.1" || { echo "FATAL: 树里无 musl loader" >&2; exit 1; }
+    test -f "${STAGE}/files/lib/libc.musl-aarch64.so.1" || { echo "FATAL: 树里无 musl libc" >&2; exit 1; }
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginx-proxy)
+    # 共享代理隧道树包（2026-09-26）：Alpine v3.22 community stunnel
+    # 闭包 4 apk（musl+libssl3+libcrypto3 与 git 包同钉同缓存），
+    # sha256 逐件钉死（TOFU 于下载日）。conf/PSK 不进包——设备侧
+    # /etc/stunnel/ 是真源（缺 conf 启动即退=预期，先写后装）。
+    APK_DIR="${ROOT}/out/apk-cache"
+    # 源走 tuna 镜像（jq/bash 同例：镜像与 dl-cdn 同源同 sha，dl-cdn
+    # 当夜连不通；sha256 钉表不变）。
+    ALPINE_MAIN="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/main/aarch64"
+    ALPINE_COMMUNITY="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/community/aarch64"
+    PROXY_APKS="
+      musl-1.2.5-r13:d616c430bcbe0bf452b7f6ea2669f2cad14e85644a7599f4f495115d021742ef
+      libssl3-3.5.9-r0:338c9f6154582b4b76455a59f95538bcea8df039c5c72916dd2d8d0d844c9583
+      libcrypto3-3.5.9-r0:ede2ef7eca3b65a42e902aaf7890f9c5647dca0c55123a817179ad9f3bc6ef24
+      stunnel-5.75-r0:deae6ff3fe03e6a696bbefd9a7ba01062067625cc147c9fedb3f8354ab4c422e
+    "
+    mkdir -p "${APK_DIR}" "${STAGE}/files"
+    for pair in ${PROXY_APKS}; do
+      apk="${pair%%:*}"; want="${pair##*:}"
+      f="${APK_DIR}/${apk}.apk"
+      repo="main"; [ "${apk}" = "stunnel-5.75-r0" ] && repo="community"
+      base="${ALPINE_MAIN}"; [ "${repo}" = "community" ] && base="${ALPINE_COMMUNITY}"
+      if [ ! -s "${f}" ] || [ "$(shasum -a 256 "${f}" | cut -d' ' -f1)" != "${want}" ]; then
+        echo "  fetch ${apk}"
+        curl -fsSL -o "${f}" "${base}/${apk}.apk" \
+          || { echo "FATAL: fetch ${apk} 失败" >&2; exit 1; }
+      fi
+      got="$(shasum -a 256 "${f}" | cut -d' ' -f1)"
+      [ "${got}" = "${want}" ] \
+        || { echo "FATAL: ${apk} sha256 不符（钉 ${want} 得 ${got}）" >&2; exit 1; }
+      tar -xzf "${f}" -C "${STAGE}/files"
+    done
+    # apk 家务件 + 赘重裁掉（同 git 分支：TLS 默认 provider 内建于
+    # libcrypto，ossl-modules/engines 无人读；stunnel 自带的 etc/conf
+    # 样例删——真源在设备侧 /etc/stunnel/）。
+    rm -f "${STAGE}/files"/.PKGINFO "${STAGE}/files"/.SIGN.* \
+          "${STAGE}/files"/.pre-* "${STAGE}/files"/.post-* "${STAGE}/files"/.trigger*
+    rm -rf "${STAGE}/files"/usr/share/man "${STAGE}/files"/usr/share/doc \
+           "${STAGE}/files"/usr/share/locale "${STAGE}/files"/etc \
+           "${STAGE}/files"/usr/lib/engines-3 "${STAGE}/files"/usr/lib/ossl-modules
+    # wrapper 面（git 包同工艺：/lib loader 首跑自链 + LD_LIBRARY_PATH）。
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${RECIPE}/bin/aginx-proxy" "${STAGE}/files/bin/aginx-proxy"
+    find "${STAGE}/files" -type d -exec chmod 755 {} +
+    # 闭包钉死门：本体 + loader + 全部 DT_NEEDED soname
+    test -x "${STAGE}/files/usr/bin/stunnel" || { echo "FATAL: 树里无 usr/bin/stunnel" >&2; exit 1; }
+    test -f "${STAGE}/files/lib/ld-musl-aarch64.so.1" || { echo "FATAL: 树里无 musl loader" >&2; exit 1; }
+    for so in libc.musl-aarch64.so.1 libcrypto.so.3 libssl.so.3; do
+      find "${STAGE}/files/lib" "${STAGE}/files/usr/lib" -maxdepth 1 -name "${so}" | grep -q . \
+        || { echo "FATAL: 闭包缺 soname ${so}" >&2; exit 1; }
+    done
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  sqlite3)
+    # 上游静态包（一切皆CLI 裁决 2026-10-10）：sqlite.org amalgamation
+    # 单件 zig cc musl 全静态——零闭包零 loader，直接落 bin/sqlite3。
+    # zip 以尺寸+sha256 双钉（TOFU 于下载日：官方只登 SHA3-256，本仓
+    # sha256 自钉；升版=改钉改 pkg.toml）。缓存 out/sqlite-cache 复用。
+    SQLITE_DIR="${ROOT}/out/sqlite-cache"
+    SQLITE_ZIP="${SQLITE_DIR}/sqlite-amalgamation-3540000.zip"
+    SQLITE_SIZE=2990479
+    SQLITE_SHA=68e913b0fe8ec6b4e5f391c594a28872884e80d6cd042a1e50c957be46b5aa4d
+    mkdir -p "${SQLITE_DIR}"
+    if [ ! -s "${SQLITE_ZIP}" ] || [ "$(wc -c < "${SQLITE_ZIP}" | tr -d '[:space:]')" != "${SQLITE_SIZE}" ] \
+       || [ "$(shasum -a 256 "${SQLITE_ZIP}" | cut -d' ' -f1)" != "${SQLITE_SHA}" ]; then
+      echo "  fetch sqlite-amalgamation-3540000.zip"
+      curl -fsSL -o "${SQLITE_ZIP}" "https://sqlite.org/2026/sqlite-amalgamation-3540000.zip" \
+        || { echo "FATAL: fetch amalgamation 失败" >&2; exit 1; }
+    fi
+    sz="$(wc -c < "${SQLITE_ZIP}" | tr -d '[:space:]')"
+    [ "${sz}" = "${SQLITE_SIZE}" ] || { echo "FATAL: amalgamation 尺寸不符（钉 ${SQLITE_SIZE} 得 ${sz}）" >&2; exit 1; }
+    got="$(shasum -a 256 "${SQLITE_ZIP}" | cut -d' ' -f1)"
+    [ "${got}" = "${SQLITE_SHA}" ] || { echo "FATAL: amalgamation sha256 不符（钉 ${SQLITE_SHA} 得 ${got}）" >&2; exit 1; }
+    AMAL="${SQLITE_DIR}/src-3540000"
+    if [ ! -f "${AMAL}/sqlite-amalgamation-3540000/sqlite3.c" ]; then
+      rm -rf "${AMAL}" && mkdir -p "${AMAL}"
+      unzip -qo "${SQLITE_ZIP}" -d "${AMAL}"
+    fi
+    echo "==> zig cc sqlite3（aarch64-linux-musl 静态，-s 链接期 strip）"
+    SQL_BIN="${SQLITE_DIR}/sqlite3-aarch64"
+    zig cc -target aarch64-linux-musl -O2 -s -DSQLITE_THREADSAFE=1 -DHAVE_READLINE=0 \
+      -o "${SQL_BIN}" "${AMAL}/sqlite-amalgamation-3540000/shell.c" \
+      "${AMAL}/sqlite-amalgamation-3540000/sqlite3.c" -lm
+    file "${SQL_BIN}" | grep -q "statically linked" \
+      || { echo "FATAL: sqlite3 非 musl 静态（$(file "${SQL_BIN}")）" >&2; exit 1; }
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${SQL_BIN}" "${STAGE}/files/bin/sqlite3"
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginxresearch)
+    # 外源树包（2026-10-08 首包 v0.1.0）：真身=独立仓 aginxresearch
+    # （~/Documents/aginxresearch，与 aginxbrowser 同级、独立开发线，
+    # 本仓只装配不仿制——aginx-gateway 同模式）。out-of-tree
+    # CARGO_TARGET_DIR 保独立仓工作树零改动，--locked 钉依赖闭包。
+    # v0.1.1（#472 运维件归包）：research-loop wrapper 随树落
+    # files/libexec/，[service] 单元归包——设备侧手拷 svc.d 件退役。
+    RES="${AGINX_RESEARCH:-$HOME/Documents/aginxresearch}"
+    RES_BUILD="${ROOT}/out/research-build"
+    [ -f "${RES}/engine/Cargo.toml" ] || { echo "FATAL: 独立仓不在 ${RES}（AGINX_RESEARCH 可改指）" >&2; exit 1; }
+    echo "==> zigbuild aginxresearch（${RES}，musl，缓存则秒过）"
+    (cd "${RES}" && CARGO_TARGET_DIR="${RES_BUILD}" \
+      cargo zigbuild --release --locked --target aarch64-unknown-linux-musl)
+    RES_BIN="${RES_BUILD}/aarch64-unknown-linux-musl/release/aginxresearch"
+    [ -x "${RES_BIN}" ] || { echo "FATAL: ${RES_BIN} 未产出" >&2; exit 1; }
+    file "${RES_BIN}" | grep -q "statically linked" \
+      || { echo "FATAL: aginxresearch 非 musl 静态（$(file "${RES_BIN}")）" >&2; exit 1; }
+    mkdir -p "${STAGE}/files/bin" "${STAGE}/files/libexec"
+    install -m 755 "${RES_BIN}" "${STAGE}/files/bin/aginxresearch"
+    install -m 755 "${ROOT}/pkgs/aginxresearch/files/libexec/research-loop" \
+      "${STAGE}/files/libexec/research-loop"
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  morning-report)
+    # 零编译运维包（#472 运维件归包，v0.1.0）：wrapper 壳脚本入树
+    # files/libexec/（face /var/bin/morning-report），cron 08:00 线随包
+    # [cron] 块落位（安装器改表+touch 目录——busybox crond mtime 律）。
+    # 手拷 /usr/libexec/aginx/morning-codex.sh + 手写 crontab 行退役。
+    mkdir -p "${STAGE}/files/libexec"
+    install -m 755 "${ROOT}/pkgs/morning-report/files/libexec/morning-codex.sh" \
+      "${STAGE}/files/libexec/morning-codex.sh"
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginx-fg)
+    # 可选电源包（2026-10-12）：crates/fg musl 静态 → files/bin/aginx-fg
+    # + [service] run 常驻。redfin 有 /dev/qg；服务器板不装。
+    echo "==> zigbuild aginx-fg（musl，缓存则秒过）"
+    (cd "${ROOT}" && cargo zigbuild --release --target aarch64-unknown-linux-musl -p aginx-fg)
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${TARGET_DIR}/aginx-fg" "${STAGE}/files/bin/aginx-fg"
+    file "${STAGE}/files/bin/aginx-fg" | grep -q "statically linked" \
+      || { echo "FATAL: aginx-fg 非 musl 静态（$(file "${STAGE}/files/bin/aginx-fg")）" >&2; exit 1; }
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  aginx-boot-ok)
+    # A/B 标记包（2026-10-26，债 #346 刀）：crates/svc 的 aginx-boot-ok
+    # musl 静态；等待逻辑内嵌单元 args（v0.1.1——wrapper face 旧代安装
+    # 器不造，cmd 指 /bin/sh 才不 absent）。oneshot_async 单元。无 A/B
+    # 的板（X2）不装；redfin 走烤内 rcS 路径不装。
+    echo "==> zigbuild aginx-svc（musl，缓存则秒过）"
+    (cd "${ROOT}" && cargo zigbuild --release --target aarch64-unknown-linux-musl -p aginx-svc)
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${TARGET_DIR}/aginx-boot-ok" "${STAGE}/files/bin/aginx-boot-ok"
+    file "${STAGE}/files/bin/aginx-boot-ok" | grep -q "statically linked" \
+      || { echo "FATAL: aginx-boot-ok 非 musl 静态（$(file "${STAGE}/files/bin/aginx-boot-ok")）" >&2; exit 1; }
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
+  *)
+    echo "FATAL: 未知包名 ${PKG}（两裸包/换芯树包/两树包/工具双包/三树包/刀F三包 zigbuild / 上游树包 git / sqlite3 / aginx-proxy / 频道两包 / aginxresearch / morning-report / aginx-fg / aginx-boot-ok）" >&2
+    exit 1
+    ;;
+esac
+
+install -m 644 "${RECIPE}/pkg.toml" "${RECIPE}/SKILL.md" "${STAGE}/"
+
+# 模型文件统一 644 / 目录 755——cp -R 的 mode 语义 BSD/GNU 不一，不赌
+if [ -d "${STAGE}/files/models" ]; then
+  find "${STAGE}/files/models" -type d -exec chmod 755 {} +
+  find "${STAGE}/files/models" -type f -exec chmod 644 {} +
+fi
+
+# MEMBER_MAX 闸（见头注）
+WARN_BYTES=480000000
+FATAL_BYTES=536870912
+while IFS= read -r f; do
+  sz="$(wc -c < "${f}" | tr -d '[:space:]')"
+  if [ "${sz}" -ge "${FATAL_BYTES}" ]; then
+    echo "FATAL: ${f#"${STAGE}"/} ${sz}B ≥ MEMBER_MAX 256MiB——安装器拒收（提 MEMBER_MAX 或拆包）" >&2
+    exit 1
+  fi
+  if [ "${sz}" -gt "${WARN_BYTES}" ]; then
+    echo "WARN: ${f#"${STAGE}"/} ${sz}B >240MB——贴 MEMBER_MAX 顶" >&2
+  fi
+done < <(find "${STAGE}" -type f)
+
+echo "==> tar ${TARNAME}（成员序 ${MEMBERS}）"
+# COPYFILE_DISABLE：macOS 上挡 AppleDouble/扩展属性头进 ustar
+# shellcheck disable=SC2086 — MEMBERS 是受控词表
+COPYFILE_DISABLE=1 tar --format ustar -cf "${OUT}/${TARNAME}" -C "${STAGE}" ${MEMBERS}
+
+if command -v shasum >/dev/null 2>&1; then
+  SHA="$(shasum -a 256 "${OUT}/${TARNAME}" | cut -d' ' -f1)"
+else
+  SHA="$(sha256sum "${OUT}/${TARNAME}" | cut -d' ' -f1)"
+fi
+printf '%s\n' "${SHA}" > "${OUT}/${TARNAME}.sha256"
+
+# manifest 片段（deps 是清单第 6 列；L0 全 opt——刀4 翻档，镜像组装段收走）
+echo "${PKG} ${URL} ${SHA} opt ${VER}${DEPS:+ ${DEPS}}"
+
+if [ -n "${SERIAL}" ]; then
+  echo "==> push ${SERIAL}（dev 免签通道）"
+  adb -s "${SERIAL}" push "${OUT}/${TARNAME}" "/data/local/tmp/${TARNAME}"
+  adb -s "${SERIAL}" shell "/usr/bin/aginx-pkg install ${PKG} /data/local/tmp/${TARNAME} ${SHA}"
+fi

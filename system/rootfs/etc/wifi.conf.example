@@ -1,0 +1,15 @@
+# AginxOS Wi-Fi configuration template (M5).
+# Copy to /etc/wifi.conf on the device and fill in your real credentials:
+#   adb -s aginxosredfin push wifi.conf /etc/wifi.conf
+# /etc/init.d/net-bringup reads it at boot and joins with aginx-net-join (原名 wifi-join)..
+# The file with the real passphrase lives on the device only — it is
+# never committed to this repo (same rule as vendor blobs, DECISIONS §7).
+ssid=YourNetworkName
+psk=YourPassphrase
+# #64 multi-network fallback table (optional): when the current pair
+# fails twice, net-rejoin tries these slots in numeric order (one
+# attempt each; an SSID not on air fails in one ~5 s scan). The winner
+# is promoted to ssid=/psk= and the old network takes its slot —
+# sticky-until-dead, no signal-quality roaming. Max 4 slots.
+#alt1_ssid=BackupNetwork
+#alt1_psk=BackupPassphrase

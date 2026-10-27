@@ -1,0 +1,22 @@
+[package]
+name = "aginx-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "the front desk: UDS face (list/status/install/remove) + system gateway entry (engine commoditized, knife 4-4)"
+
+[[bin]]
+name = "aginx-server"
+path = "src/main.rs"
+
+[dependencies]
+agio = { path = "../agio" }
+carrier-clone = { path = "../clone" }
+carrier-types = { path = "../types" }
+dirs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,115 @@
+#!/bin/sh
+# aginx:summary=local backup line v3: snapshot the whole state world, list, verify, keep 7
+# aginx:args=now | list | verify <file>
+# aginx:examples=now
+# aginx:examples=list
+# aginx:examples=verify /var/backups/aginx/backup-<ts>.tar.gz
+# aginx:group=backup
+# v3 (#456, 2026-10-08): the state world moved when the world model did —
+# /home IS the root now (AGENTS.md personhood + workflows/ capability faces
+# + channels/ + research/ instances + engine homes .grok/.codex). v2 guarded
+# on /home/.aginx, which no longer exists, so the nightly 04:17 run died
+# every night with zero backups on disk. Scope now = wholesale /home
+# (nothing missed when new faces appear) minus transient dirs
+# (research/dl download staging, research/logs, .cache) + /var/lib/aginx
+# (secret store excluded, §9) + /etc/aginx. One tar = the machine's soul,
+# local half of the black-box doctrine.
+# SQLite discipline: instance .db files ride as the WAL trio (db+wal+shm)
+# copied together by cp -a; 04:17 sits ~10min clear of the 04:07 research
+# fire, and a mid-write trio restores under SQLite crash-recovery semantics.
+# The secret store NEVER rides a backup: the (future) push half's auth must
+# not bootstrap from its own cargo (DECISIONS §9); keys are re-enterable
+# (`aginx-secret set`). `verify` asserts that exclusion against the finished
+# tar, not just the staging discipline.
+# Credential class (#467, aligned with fleet.sh EXCLUDES): /etc/aginx/env
+# (brain key), /etc/aginx/config.toml (relay_secret + jwt_secret) and the
+# engine OAuth files (.codex/.grok auth.json) never ride either — same §9
+# rationale: a backup that carries its own auth bootstraps an impostor.
+# Restore therefore re-enters four things: brain key (env), relay_secret +
+# jwt (config.toml — re-pair or pipe), codex/grok login (device-code login).
+# Engine session transcripts (.grok/sessions, .codex/sessions) are engine
+# labor exhaust — v3.2 (2026-10-27, soul-boundary ruling) keeps them out of
+# the tar: engines are commodity labor (replaceable), the value is the
+# persona in /home, not the labor logs. Everything else in .codex/.grok
+# still rides.
+# Restore is manual: unpack and copy members back (stop aginx-server first
+# for /home), or fish a single file out of the tar.
+# Device-local trust domain only. Pushing anywhere requires the server half
+# that does not exist yet.
+set -eu
+
+B=/var/backups/aginx
+KEEP=7
+
+die() { echo "aginx-backup: $*" >&2; exit 1; }
+
+cmd_now() {
+  TS=$(date +%Y%m%d-%H%M%S)
+  S=$B/.build-$TS
+  mkdir -p "$S/var/lib" "$S/etc"
+
+  # The world's anchor is the personhood file — a /home without it is not
+  # the state world but some other tree.
+  [ -f /home/AGENTS.md ] || die "no /home/AGENTS.md — this is not the state world"
+  cp -a /home "$S/"
+  cp -a /var/lib/aginx "$S/var/lib/" 2>/dev/null || true
+  cp -a /etc/aginx "$S/etc/" 2>/dev/null || true
+  # Transients never ride: download staging, logs, generic caches.
+  rm -rf "$S/home/research/dl" "$S/home/research/logs" "$S/home/.cache"
+  # v3.2: engine labor exhaust never rides (soul-boundary ruling).
+  rm -rf "$S/home/.grok/sessions" "$S/home/.codex/sessions"
+  # §9: the sidecar store is the one member class that must not ride.
+  rm -rf "$S/var/lib/aginx/secret"
+  # Credential class (#467, fleet.sh-aligned): config/env/engine OAuth.
+  rm -rf "$S/etc/aginx/env" "$S/etc/aginx/config.toml" \
+         "$S/home/.codex/auth.json" "$S/home/.grok/auth.json"
+
+  OUT=$B/backup-$TS.tar.gz
+  tar czf "$OUT" -C "$S" home var etc
+  rm -rf "$S"
+
+  # retention: keep the newest KEEP, drop older (ls -t newest first)
+  ls -1t "$B"/backup-*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r f; do
+    [ -n "$f" ] && rm -f "$f"
+  done
+
+  echo "backup: $OUT ($(du -h "$OUT" | cut -f1))"
+}
+
+cmd_list() {
+  [ -d "$B" ] || { echo "no backups yet ($B missing)"; exit 0; }
+  ls -1t "$B"/backup-*.tar.gz 2>/dev/null | while read -r f; do
+    echo "$(du -h "$f" | cut -f1)  $f  $(tar -tzf "$f" 2>/dev/null | wc -l | tr -d ' ') members"
+  done
+}
+
+cmd_verify() {
+  [ -f "$1" ] || die "no such file: $1"
+  gzip -t "$1" || die "gzip integrity check failed"
+  tar -tzf "$1" 2>/dev/null | grep -q '^home/AGENTS.md' \
+    || die "personhood member missing"
+  tar -tzf "$1" 2>/dev/null | grep -q '^var/lib/aginx/' \
+    || die "var/lib state member missing"
+  # §9 reverse assertion: the exclusion is a contract, so it is checked
+  # against the tar itself — a staging bug must fail verify, loudly.
+  # Credential class rides the same contract (#467). Exact members are
+  # line-anchored (^…$): a bare substring would false-positive on
+  # auth.json.lock (caught live on device, 2026-10-09 — fail-closed but
+  # noisy). The secret store keeps prefix semantics: ANY member under it
+  # is a violation.
+  for banned in '^var/lib/aginx/secret' '^etc/aginx/env$' '^etc/aginx/config.toml$' \
+                '^home/.codex/auth.json$' '^home/.grok/auth.json$'; do
+    if tar -tzf "$1" 2>/dev/null | grep -q "$banned"; then
+      die "SECRET IN BACKUP ($banned) — do not ship or push this file"
+    fi
+  done
+  n=$(tar -tzf "$1" 2>/dev/null | wc -l | tr -d ' ')
+  echo "verify: ok (${n} members, personhood present, secret + credential class excluded)"
+}
+
+case "${1:-}" in
+  now)    cmd_now ;;
+  list)   cmd_list ;;
+  verify) [ $# -ge 2 ] || die "usage: aginx-backup verify <file>"; cmd_verify "$2" ;;
+  *)      echo "usage: aginx-backup now | list | verify <file>" >&2; exit 2 ;;
+esac

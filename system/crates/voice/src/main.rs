@@ -1,0 +1,1556 @@
+//! aginx-voice — 语音对话守护（M42a，产品定义 2026-09-05：手机即智能体）。
+//!
+//! 产品面唯一的输入是语音（PTT=按住音量下键）和眼（M42b/M42g），输出是脸
+//! （/run/aginx-voice/face → aterm 渲染）和嘴（TTS）。**拉式语音**（2026-09-04
+//! 用户收据：识别和回应都是毫秒级，唯独嘴是慢车道）——回应默认只上脸，
+//! 用户点名（「你说给我听」「念一下」「再念一遍」）才出声。协议是**命令
+//! 优先**的封闭词表状态机（protocol.rs，2026-09-06 重设计：无驻留态，机器
+//! 缺什么自己补什么——连网先查现状再试记忆，最后才睁眼等码），没有 LLM
+//! ——WiFi 必须在 LLM 可用之前连得上。
+//!
+//! **一眼自举（M42c）**：AGINXPAIR1 配对码是 WiFi+身份的超集，眼取景命中
+//! 即 Act::PairApply——连网 + 身份三件进 /etc/aginx/env + 快速校时 + 拉起
+//! 母体两单元，不回读不确认。秘密只在 env 文件里，永不上脸/日志。
+//!
+//! **前台模式（N2②）**：env `VOICED_FRONT=<aginx 路由器路径>` 时自由文本
+//! （封闭词表 miss）改投新前台——`aginx agent send`（母体/化身光标，
+//! AGINX_SOCK 决定找哪台 server）。封闭词表仍本地优先（离线地板），
+//! 前台不可达落回地板话。不设此 env = 老行为分毫不动。
+//!
+//! 调试面（收据阶梯，从嘴/耳单器官到全环）：
+//!   aginx-voice --say "文本"          只测嘴（TTS→扬声器）
+//!   aginx-voice --hear <wav文件>      只测耳（WAV→ASR→打印文本）
+//!   aginx-voice --inject "文本"       喂状态机走全流程（不出声，Act 真执行）
+//!   aginx-voice --script              stdin 每行一条 Heard，同一 Vm 跨步（多步流）
+//!   aginx-voice --face                打印当前屏面 JSON
+//!
+//! 没有嘴耳同开的回环自检：M18 的硬件收据写明 MM1 边放边采会把放音叠
+//! 进采集（数字回环是失真副本，880Hz 可验、语音不可认，2026-09-04 实测
+//! ASR 出"うん、うん"）——产品路径本来也是顺序的：PTT 采完才 TTS。
+
+mod audio;
+mod face;
+mod protocol;
+mod ptt;
+mod screen;
+
+use protocol::{Act, CallEnd, Ev, NetState, Out, PowerAction, Vm};
+use std::io::Read as _;
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+/// 刀4 页=会话：屏上 hold 带来的页靶（当前页卡路径）。采集起步时定值
+/// （屏上 hold=term 写的页靶；PTT=清空新任务），本回合 Chat 臂一次取用
+/// ——「在哪个页就是哪个对话的延续」。主循环单线程 set/take，无竞争。
+static CHAT_PAGE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+const JOIN_BUDGET_SECS: u32 = 90;
+/// 母体一轮（真 brain，含工具往返）的等待预算——超了杀掉落地板话。
+const FRONT_BUDGET_SECS: u32 = 90;
+/// 眼取景总时长上限：超时闭眼（人对准之前机器不催，但也不能永远开着镜头）。
+/// 45s（09-10 +15s）：AF 扫描（grace+settle+粗+细）吃掉前 ~13s，剩 ~30s
+/// 才是合焦取景——30s 时代用户「很快就断了」的体感就是扫描没完窗口先尽。
+const EYE_VIEW_SECS: u64 = 45;
+/// M47⑤ 取景子进程重生预算：rc≠0（含 rc=3 连续 fence 超时）/ 卡帧 / 崩溃
+/// 都杀掉重生，连败这么多次就闭眼报失败。
+const EYE_RETRIES: u8 = 3;
+/// 取景帧卡死判据：mtime 这么久不更新（首帧未落 = 子进程启动后这久还没
+/// 文件）就杀掉重生。
+const EYE_STUCK_SECS: u64 = 5;
+/// 取景帧 OCR 节拍：ag-ocr 一发没字帧只付 det ~0.9s / 整页 ~1.7s，比
+/// QR 重一个量级——3s 一拍把大核均摊压住，对准节奏也够快。窗口同
+/// EYE_VIEW_SECS。
+const OCR_EYE_SPACING_SECS: u64 = 3;
+
+/// 刀5b（M48 刀5）：语音直拨。CLI 真身在 aginx-call 包（opt-in，缺包=
+/// 干净的 CallEnd::Failed 地板话，同 agf 桥先例）；名录 /etc/aginx/call.conf。
+const CALL_BIN: &str = "/var/bin/aginx-call";
+const CALL_CONF: &str = "/etc/aginx/call.conf";
+const CALL_LOG: &str = "/run/aginx-voice/call.log";
+
+/// 通话子进程（刀5b）：spawn 后由主循环 try_wait 轮询，退出即按 stdout
+/// 标记分类终局回喂。stdout 管道必须**后台排水**（刀5c 根因：tracing
+/// 默认写 stdout，rvoip 每帧 INFO 洪流 ~0.6s 灌满 64KB 管道，子进程写
+/// 日志一阻塞媒体线程就冻死——手机→对端断流在第 30 帧、进程僵而不死
+/// 连 SIGINT 都收不进）。排水线程顺带把标记蓄进 out 供终局分类；
+/// RUST_LOG=warn 把洪流压在源头。tracing 落 call.log。挂断=SIGINT
+/// （子进程 tokio ctrl_c 臂=优雅 BYE）。
+struct CallView {
+    child: std::process::Child,
+    out: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    target: String,
+    since: Instant,
+}
+
+/// 名录查找（刀5b）：`name = sip:uri` 一行一目，# 注释；查名大小写
+/// 不敏感（ASR 不保大小写还原）。None = 查无此人。
+fn call_lookup(name: &str) -> Option<String> {
+    let txt = std::fs::read_to_string(CALL_CONF).ok()?;
+    let want = name.to_lowercase();
+    txt.lines().find_map(|l| {
+        let l = l.trim();
+        if l.is_empty() || l.starts_with('#') {
+            return None;
+        }
+        let (k, v) = l.split_once('=')?;
+        (k.trim().to_lowercase() == want)
+            .then(|| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+/// spawn 拨出腿（刀5b章程：`aginx-call talk <uri>`）。AGINX_CALL_BIND
+/// 钉本机 wlan0 IP——Config::local 把 127.0.0.1 烧进 local_ip/bind_addr/
+/// local_uri，回环套接字连 LAN 对端都发不出去（刀3 收据）。
+fn call_spawn(
+    uri: &str,
+) -> Result<(std::process::Child, std::sync::Arc<std::sync::Mutex<Vec<u8>>>), String> {
+    let bind = wlan0_ip().ok_or("wlan0 没地址")?;
+    let log = std::fs::File::create(CALL_LOG).ok();
+    let mut child = Command::new(CALL_BIN)
+        .args(["talk", uri])
+        .env("AGINX_CALL_BIND", &bind)
+        .env("RUST_LOG", "warn")
+        .stdout(std::process::Stdio::piped())
+        .stderr(log.as_ref().and_then(|f| f.try_clone().ok()).map_or_else(
+            std::process::Stdio::null,
+            std::process::Stdio::from,
+        ))
+        .spawn()
+        .map_err(|e| format!("aginx-call spawn: {e}"))?;
+    // 排水线程：管道无人读则写满即冻（见 CallView 注释）。读到的字节
+    // 蓄进共享缓冲——终局分类只认 `[aginx-call]` 标记，不怕混流。
+    let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    if let Some(mut r) = child.stdout.take() {
+        let sink = out.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut b = [0u8; 4096];
+            loop {
+                match r.read(&mut b) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sink.lock().unwrap().extend_from_slice(&b[..n]),
+                }
+            }
+        });
+    }
+    Ok((child, out))
+}
+
+/// 通话中音量键（上/下皆可，章程裁决）= 挂断：SIGINT → 子进程优雅 BYE。
+/// 不 take——终局仍由主循环看到退出后统一分类回喂（Ctrl+C 路径 exit 0
+/// + stdout 带 call up 标记 = Done）。
+fn call_hangup(call: &mut Option<CallView>) {
+    if let Some(cv) = call.as_mut() {
+        eprintln!(
+            "aginx-voice: call hangup (volume key), {} elapsed {:.0}s",
+            cv.target,
+            cv.since.elapsed().as_secs_f32()
+        );
+        unsafe { libc::kill(cv.child.id() as i32, libc::SIGINT) };
+    }
+}
+
+/// 子进程退出后的终局分类（刀5b 三态）：stdout 带 `[aginx-call] call up`
+/// = 接通过——exit 0 = 优雅结束（Done），非 0 = 桥断（Failed）；从未
+/// 接通 = 15s 拨号窗尽/不可达（NoAnswer，窗内建在 call_and_wait）。
+fn call_classify(cv: &mut CallView) -> CallEnd {
+    let buf = String::from_utf8_lossy(&cv.out.lock().unwrap()).into_owned();
+    let ok = cv.child.wait().map(|s| s.success()).unwrap_or(false);
+    let up = buf.contains("[aginx-call] call up");
+    eprintln!(
+        "aginx-voice: call {} exited rc={} up={} {:.0}s",
+        cv.target,
+        if ok { 0 } else { 1 },
+        up,
+        cv.since.elapsed().as_secs_f32()
+    );
+    match (up, ok) {
+        (true, true) => CallEnd::Done,
+        (true, false) => CallEnd::Failed,
+        _ => CallEnd::NoAnswer,
+    }
+}
+
+/// M47⑤ 眼取景常驻：一个 --forever cam-shot 子进程 + mtime 轮询。子进程
+/// 自己原子发布 eye.jpg（tmp+rename），voice 不再逐帧起停相机——双会话
+/// 撞 sensor 必翻车，相机就这一个持有者。
+struct EyeView {
+    child: std::process::Child,
+    since: Instant,
+    /// 最近一次看到的 eye.jpg mtime（None=还没见过帧）
+    mtime: Option<std::time::SystemTime>,
+    /// 上次 mtime 变化（或 spawn）时刻——卡帧自愈的基准
+    mtime_seen: Instant,
+    /// 上次发起 aginx-qr 解码时刻——解码限频（一次 100-300ms，逐帧跑把
+    /// loop 吃满还抢 cam-shot 编码 CPU；2Hz 对人对准足够）
+    last_qr: Instant,
+    /// 上次发起 ag-ocr 识读时刻——节拍限频（None=本会话还没试过）
+    ocr_last: Option<Instant>,
+    retries: u8,
+}
+
+/// 前台模式开关：VOICED_FRONT=新前台路由器路径（aginx）→ 开。
+/// 只认这个 env，不猜 PATH——试跑期路由器在隔离树里，路径是显式合同。
+fn front_bin() -> Option<String> {
+    match std::env::var("VOICED_FRONT") {
+        Ok(v) if !v.trim().is_empty() => Some(v),
+        _ => None,
+    }
+}
+
+/// Vm 构造口：前台模式开 with_front，否则老 Vm（行为分毫不动）。
+/// 面法B：AGINX_POWER_KEY 从 /etc/aginx/env 经 unit env_file 进程环境，
+/// norm 后注入（与 Heard 同一归一化——口令怎么说的就怎么比）；空值/缺键
+/// = 未设置 = fail-closed。值只进 Vm，永不回显/入日志（日志只记 set/unset）。
+fn make_vm() -> Vm {
+    let key = std::env::var("AGINX_POWER_KEY")
+        .ok()
+        .map(|v| protocol::norm(&v))
+        .filter(|v| !v.is_empty());
+    eprintln!(
+        "aginx-voice: power key {}",
+        if key.is_some() { "set" } else { "unset" }
+    );
+    let vm = if front_bin().is_some() {
+        Vm::with_front()
+    } else {
+        Vm::new()
+    };
+    vm.with_power_key(key)
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("--say") => {
+            let text = args.get(2).expect("usage: aginx-voice --say <text>");
+            let brain = audio::Brain::from_env();
+            say(text, brain.as_ref());
+        }
+        Some("--hear") => {
+            let path = args.get(2).expect("usage: aginx-voice --hear <wav>");
+            let brain = audio::Brain::from_env();
+            let wav = std::fs::read(path).expect("read wav");
+            let text = hear(&wav, brain.as_ref()).expect("asr failed");
+            println!("{text}");
+        }
+        Some("--inject") => {
+            let text = args.get(2).expect("usage: aginx-voice --inject <text>").clone();
+            let mut vm = make_vm();
+            // v4③：transcript 与 PTT 同法上脸（term 光标面打出）；词表应答
+            // 随 run_outs 的 Say/Speak 换行。旧结果面随 face::write 的
+            // result=false 下降沿由 term 自拆（v4⑥ 同步失效线）。
+            face::set_line(Some(&text));
+            face::write(false);
+            let outs = vm.step(Ev::Heard(text));
+            run_outs(&mut vm, outs, None, &mut None, &mut None);
+        }
+        Some("--script") => {
+            // 收据阶梯：stdin 每行一条 Heard，同一个 Vm 跨步保持（--inject
+            // 一次一进程，扫码→确认这种多步流跑不完整）。run_outs 在步间阻塞
+            // ——相机/TTS 落完才读下一行，喂两行也能按序走完。
+            let brain = audio::Brain::from_env();
+            let mut vm = make_vm();
+            face::write(false);
+            let mut line = String::new();
+            let mut step = 0usize;
+            loop {
+                line.clear();
+                match std::io::stdin().read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let t = line.trim_end_matches('\n');
+                        if t.is_empty() {
+                            continue;
+                        }
+                        // 只记步数不记原文——stdin 可能含口令，日志零回显。
+                        step += 1;
+                        eprintln!("aginx-voice: script step {step}");
+                        let outs = vm.step(Ev::Heard(t.to_string()));
+                        run_outs(&mut vm, outs, brain.as_ref(), &mut None, &mut None);
+                    }
+                }
+            }
+        }
+        Some("--face") => match face::read() {
+            Some(s) => println!("{s}"),
+            None => println!("(no face)"),
+        },
+        _ => daemon(),
+    }
+}
+
+/// 眼取景一轮的退出决定（M47⑤）：命中 or 闭眼（带给人一句话）。
+enum EyeExit {
+    Hit(Vec<String>),
+    OcrHit(Vec<String>),
+    GiveUp(&'static str),
+}
+
+/// 杀掉旧子进程并在原 EyeView 里重生（retries+1、mtime 清零）。返回 Err
+/// = spawn 失败——下一轮 try_wait 会再走重生/放弃路径，不用在这里叠状态。
+fn eye_respawn(ev: &mut EyeView) -> Result<(), String> {
+    eye_stop(&mut ev.child);
+    ev.retries += 1;
+    ev.mtime = None;
+    ev.mtime_seen = Instant::now();
+    ev.last_qr = Instant::now();
+    ev.child = eye_spawn()?;
+    Ok(())
+}
+
+// ---- #282 开机等网（网络是最后一步）--------------------------------------
+// bootcard 已改盯 phase-1 `done` 退场（光标不等网），等网的故事搬到这里：
+// 光标面上「正在联网…」打字行 → boot.state `internet ok` → 问候上脸。
+// 问候 = status_text() 状态行（09-10 定稿，剧场话术退役）：开机第一句话
+// 就是机器的真实状态，与查询「状态」同一句话。
+// 只显示、不出声���不自己连网（net-bringup phase 2 / net-watch 是写者）。
+// 跑在主循环 200ms 节拍里（内部 5s 轮询门），无线程无阻塞。
+const BOOT_STATE: &str = "/run/boot.state";
+/// 轮询间隔：boot.state phase 2 每步落行，5s 粒度足够。
+const BOOT_NET_POLL: Duration = Duration::from_secs(5);
+/// 等网窗口：超过即静默退役（红警面接着讲无网的故事，等待行留着不撤）。
+const BOOT_NET_WATCH: Duration = Duration::from_secs(300);
+/// 只在开机窗内布防：中午 svc 重启不问候——问候是开机的事，不是重启的事。
+const BOOT_NET_UPTIME_GATE_SECS: f64 = 180.0;
+/// 未配对机不布防（无 wifi.conf）：它的路是配对面，不是等网。
+const WIFI_CONF: &str = "/etc/wifi.conf";
+const BOOT_NET_WAITING: &str = "正在联网…";
+
+struct BootNet {
+    /// 我们放上的等待行（所有权判据：还等于它才是我们的台）。
+    mine: Option<&'static str>,
+    armed_at: Instant,
+    last_poll: Instant,
+}
+
+fn boot_state_has_internet() -> bool {
+    // 行形如 `internet ok www.baidu.com`；run/fail/缺行都算未通。
+    std::fs::read_to_string(BOOT_STATE)
+        .map(|s| s.lines().any(|l| l.trim_start().starts_with("internet ok")))
+        .unwrap_or(false)
+}
+
+fn uptime_secs() -> f64 {
+    // 读不到（非 Linux host 测试）按超窗处理——不布防。
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().and_then(|t| t.parse().ok()))
+        .unwrap_or(f64::MAX)
+}
+
+/// daemon 启动时布防。三道门：开机窗（uptime ≤180s）、已配对（wifi.conf
+/// 在）、网未通（已通就直接问候，不占台）。voice 由 svc 拉起 ~35s uptime，
+/// 正常开机两道门都过；face::write 在此窗内安全——站立结果页与等待行
+/// 互斥（任何 Chat 回合先 set_line(transcript) 破所有权）。
+fn boot_net_arm() -> BootNet {
+    let idle = || BootNet {
+        mine: None,
+        armed_at: Instant::now(),
+        last_poll: Instant::now(),
+    };
+    if uptime_secs() > BOOT_NET_UPTIME_GATE_SECS || !std::path::Path::new(WIFI_CONF).exists() {
+        return idle();
+    }
+    if boot_state_has_internet() {
+        let greet = status_text();
+        face::set_line(Some(&greet));
+        face::write(false);
+        eprintln!("aginx-voice: boot net up before voice — greeted");
+        return idle();
+    }
+    face::set_line(Some(BOOT_NET_WAITING));
+    face::write(false);
+    eprintln!("aginx-voice: boot net watching");
+    BootNet {
+        mine: Some(BOOT_NET_WAITING),
+        armed_at: Instant::now(),
+        last_poll: Instant::now(),
+    }
+}
+
+/// 主循环每拍调用。三路静默退出：行易主（用户说话/一次性进程改了面）→
+/// 退役；窗口尽（300s）→ 退役；internet ok → 问候上脸后退役。
+fn boot_net_tick(bn: &mut BootNet) {
+    let Some(mine) = bn.mine else { return };
+    if face::current_line().as_deref() != Some(mine) {
+        bn.mine = None;
+        eprintln!("aginx-voice: boot net line taken — retire");
+        return;
+    }
+    if bn.armed_at.elapsed() >= BOOT_NET_WATCH {
+        bn.mine = None;
+        eprintln!("aginx-voice: boot net window over — no greet");
+        return;
+    }
+    if bn.last_poll.elapsed() < BOOT_NET_POLL {
+        return;
+    }
+    bn.last_poll = Instant::now();
+    if boot_state_has_internet() {
+        // 跨进程护栏：--inject 一次性进程写的是面文件、改不到本进程静态量
+        // ——问候覆盖前再读一次面，等待行不在了就放弃（不clobber别人的台）。
+        if !face::read().is_some_and(|f| f.contains(mine)) {
+            bn.mine = None;
+            eprintln!("aginx-voice: boot net line taken — retire");
+            return;
+        }
+        let greet = status_text();
+        face::set_line(Some(&greet));
+        face::write(false);
+        bn.mine = None;
+        eprintln!("aginx-voice: boot net up — greeted");
+    }
+}
+
+fn daemon() {
+    let brain = audio::Brain::from_env();
+    let mut vm = make_vm();
+    let mut ptt = ptt::Ptt::open();
+    if ptt.is_none() {
+        eprintln!(
+            "aginx-voice: no {} — PTT dead, face only",
+            hwd::load_or_exit().input.ptt.device
+        );
+    }
+    face::write(false);
+    eprintln!(
+        "aginx-voice: up (local={}, brain={}, ptt={})",
+        audio::local_voice_ready(),
+        brain.is_some(),
+        ptt.as_ref()
+            .map(|p| p.devs())
+            .unwrap_or_else(|| "none".into())
+    );
+    // M42e: 预载常驻嘴耳模型（spawn 即返回，加载在子进程里）——第一次
+    // 说话不再等 ~4s/侧 的装载。
+    if audio::local_voice_ready() {
+        audio::warm_local_voice();
+    }
+
+    // #282 开机等网：光标面上「正在联网…」→ internet ok → 问候。
+    let mut boot_net = boot_net_arm();
+
+    let mut capturing: Option<std::process::Child> = None;
+    let mut screen_hold = false;
+    // 音量下键按下时刻：短按(<300ms)=音量−10、长按=PTT（M42e 产品面）
+    let mut ptt_down: Option<Instant> = None;
+    // 眼取景（M42g→M47⑤）：Some = 取景中（常驻子进程 + 命中轮询）。音量+
+    // 开/再按关，音量下关。帧由子进程逐张原子发布，这里只轮询 mtime 解码
+    // ——命中 WIFI: 码直接连（扫码即指令，拉式——机器开着取景等的就是
+    // 这个格式）。
+    let mut eye: Option<EyeView> = None;
+    // 通话子进程（刀5b）：Some = 通话中。期间音量键=挂断（mic 归
+    // aginx-call 独占，PTT/屏上按住都不采集——撞上必抢 PCM）。
+    let mut call: Option<CallView> = None;
+
+    // 面法B：口令等待的心跳基准（真实流逝喂进状态机，超时由协议判）
+    let mut last_tick = Instant::now();
+
+    loop {
+        // ---- PTT ----
+        if let Some(p) = ptt.as_mut() {
+            for ev in p.wait(200) {
+                match ev {
+                    ptt::PttEv::Down => {
+                        // 取景中音量下 = 闭眼（吞掉本次按压周期：不开采集，
+                        // 后续 Up 因 ptt_down 为空自然空走）
+                        let had_eye = eye.is_some();
+                        eye_shut(&mut vm, &mut eye);
+                        if had_eye {
+                            face::write(false);
+                            continue;
+                        }
+                        // 通话中音量下 = 挂断（刀5b：章程裁决上/下皆可；
+                        // mic 归 aginx-call，PTT 不采集——同吞周期法）
+                        if call.is_some() {
+                            call_hangup(&mut call);
+                            face::write(false);
+                            continue;
+                        }
+                        ptt_down = Some(Instant::now());
+                        // 刀4：PTT 无页上下文——清靶（新任务；清掉可能残留的
+                        // 上一轮屏上 hold 靶）。
+                        *CHAT_PAGE.lock().unwrap() = None;
+                        if capturing.is_none() {
+                            match audio::capture_start() {
+                                Ok(c) => {
+                                    capturing = Some(c);
+                                    eprintln!("aginx-voice: cap start");
+                                    face::set_line(None);
+                                    face::write(false);
+                                }
+                                Err(e) => eprintln!("aginx-voice: cap start {e}"),
+                            }
+                        }
+                    }
+                    ptt::PttEv::Up => {
+                        let short_tap = ptt_down
+                            .take()
+                            .is_some_and(|d| d.elapsed() < Duration::from_millis(300));
+                        if short_tap {
+                            // 短按不再减音量（enchilada 对话是按住屏幕； // D14-exempt
+                            // 音量下短按会把 TTS 打到听不见）。采集弃掉。
+                            if let Some(mut c) = capturing.take() {
+                                let _ = c.kill();
+                                let _ = c.wait();
+                            }
+                            face::write(false);
+                            continue;
+                        }
+                        if let Some(mut c) = capturing.take() {
+                            // 词尾冲刷：立即 kill 会截掉最后几百毫秒（snd-cap
+                            // 缓冲 + 松手瞬间）。2026-09-04 收据：「连接无线
+                            // 网络」只剩 0.96s，「络」被截，ASR 三连空串。
+                            std::thread::sleep(Duration::from_millis(600));
+                            let _ = c.kill();
+                            let _ = c.wait();
+                            if let Some(wav) = audio::capture_take() {
+                                face::write(false);
+                                match hear(&wav, brain.as_ref()) {
+                                    Ok(text) => {
+                                        eprintln!("aginx-voice: heard {text:?}");
+                                        // v4③：transcript 原子上脸——term
+                                        // 无论此刻在结果面还是光标面，这一
+                                        // 写把它拉回 prompt 面开打；应答由
+                                        // run_outs 的 Say/Speak 换行。
+                                        face::set_line(Some(&text));
+                                        face::write(false);
+                                        let outs = vm.step(Ev::Heard(text));
+                                        run_outs(&mut vm, outs, brain.as_ref(), &mut eye, &mut call);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("aginx-voice: asr {e}");
+                                        miss_on_face();
+                                    }
+                                }
+                            } else {
+                                // 静音闸 / 过短：上脸「没听懂」，不出声。
+                                miss_on_face();
+                            }
+                            // 尾部不得再写 face：run_outs 尾部 flush_pending
+                            // 刚翻 result:true，此处写会亚 60ms 清旗，term
+                            // 轮询永远看不见上升沿（v4⑥ 真人 PTT 首雷）。
+                            // 新动作失效由 PTT Down(231)/闭眼(223) 开头写承担。
+                        }
+                    }
+                    ptt::PttEv::VolUp => {
+                        // M42g：音量+ = 眼开关（音量+10 的老义退役；一屏一键
+                        // 一义，加音量走语音）。协议的 Act::Eye/EyeClose 走
+                        // 同两个助手——键是手动挡，机器会自己睁眼/闭眼。
+                        // 刀5b：通话中音量+ = 挂断（与音量下同一闸）。
+                        if call.is_some() {
+                            call_hangup(&mut call);
+                            face::write(false);
+                            continue;
+                        }
+                        if eye.is_some() {
+                            eye_shut(&mut vm, &mut eye);
+                        } else {
+                            eye_start(&mut vm, &mut eye);
+                        }
+                        face::write(eye.is_some());
+                    }
+                }
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        // 屏上按住说话（term 写 /run/aginx-voice/hold）。松手=提交，无短按音量。
+        // 刀4：hold 文件内容=页靶（当前页卡路径；空=首页/新任务）。
+        {
+            let want = std::path::Path::new(face::HOLD_FILE).exists();
+            if want && !screen_hold {
+                screen_hold = true;
+                // 按下沿读靶：文件由 term 一次写成，出现即内容完整。
+                let target = std::fs::read_to_string(face::HOLD_FILE)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from);
+                *CHAT_PAGE.lock().unwrap() = target;
+                // 通话中不采集（刀5b：mic 归 aginx-call；松手 take 空
+                // 自然空走）。
+                if capturing.is_none() && call.is_none() {
+                    match audio::capture_start() {
+                        Ok(c) => {
+                            capturing = Some(c);
+                            eprintln!("aginx-voice: cap start");
+                            face::set_line(None);
+                            face::write(false);
+                        }
+                        Err(e) => eprintln!("aginx-voice: cap start {e}"),
+                    }
+                }
+            } else if !want && screen_hold {
+                screen_hold = false;
+                if let Some(mut c) = capturing.take() {
+                    std::thread::sleep(Duration::from_millis(600));
+                    let _ = c.kill();
+                    let _ = c.wait();
+                    if let Some(wav) = audio::capture_take() {
+                        face::write(false);
+                        match hear(&wav, brain.as_ref()) {
+                            Ok(text) => {
+                                eprintln!("aginx-voice: heard {text:?}");
+                                face::set_line(Some(&text));
+                                face::write(false);
+                                let outs = vm.step(Ev::Heard(text));
+                                run_outs(&mut vm, outs, brain.as_ref(), &mut eye, &mut call);
+                            }
+                            Err(e) => {
+                                eprintln!("aginx-voice: asr {e}");
+                                miss_on_face();
+                            }
+                        }
+                    } else {
+                        eprintln!("aginx-voice: cap empty");
+                        miss_on_face();
+                    }
+                }
+            }
+        }
+
+        // ---- 眼取景（M47⑤：常驻子进程 + 命中轮询）----
+        let mut eye_exit: Option<EyeExit> = None;
+        if let Some(ev) = eye.as_mut() {
+            if capturing.is_some() {
+                // 罕见赛跑：PTT 采集优先，帧轮询这轮让路（子进程继续跑）
+            } else if ev.since.elapsed() >= Duration::from_secs(EYE_VIEW_SECS) {
+                eye_exit = Some(EyeExit::GiveUp("没拍到码或文字，再按音量上重试。"));
+            } else {
+                // 子进程死掉（rc=3 连续 fence 超时 / 崩溃）→ 重生 ≤EYE_RETRIES
+                match ev.child.try_wait() {
+                    Ok(Some(st)) => {
+                        eprintln!("aginx-voice: eye cam-shot exit {}", st.code().unwrap_or(-1));
+                        if ev.retries >= EYE_RETRIES {
+                            eye_exit = Some(EyeExit::GiveUp("相机反复掉线，取景关闭。"));
+                        } else if eye_respawn(ev).is_err() {
+                            eye_exit = Some(EyeExit::GiveUp("相机没起来，取景关闭。"));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("aginx-voice: eye wait {e}");
+                        eye_exit = Some(EyeExit::GiveUp("相机掉线，取景关闭。"));
+                    }
+                    Ok(None) => {
+                        // 帧轮询：mtime 变 → 解码；停滞 → 卡帧自愈重生
+                        let mtime = std::fs::metadata(face::EYE_JPG)
+                            .and_then(|m| m.modified())
+                            .ok();
+                        match mtime {
+                            Some(t) if Some(t) != ev.mtime => {
+                                ev.mtime = Some(t);
+                                ev.mtime_seen = Instant::now();
+                                // 解码限频：帧 ~8fps 全要解的话 aginx-qr
+                                // （100-300ms/次）吃满整个 loop 还耗编码
+                                // CPU——2Hz 足够对准
+                                if ev.last_qr.elapsed() >= Duration::from_millis(400) {
+                                    ev.last_qr = Instant::now();
+                                    if let Some(payloads) = eye_decode_qr() {
+                                        eye_exit = Some(EyeExit::Hit(payloads));
+                                    }
+                                }
+                                // OCR 同帧另一拍（09-10：音量+才是镜头识别
+                                // ——取景器开着就是机器在看，对准文字照样
+                                // 念）。节拍 3s：一发 ~0.9-1.7s，逐帧跑会
+                                // 吃满大核抢取景编码。文字到手同码到手。
+                                // AF 门控：扫描中（af.state=scan）歇拍——
+                                // 散焦帧读字是乱字假命中，一命中就闭眼，
+                                // 扫描被掐死（09-10 用户收据「很快就断了」）。
+                                if eye_exit.is_none()
+                                    && eye_af_ready()
+                                    && ev.ocr_last.map_or(true, |t| {
+                                        t.elapsed()
+                                            >= Duration::from_secs(OCR_EYE_SPACING_SECS)
+                                    })
+                                {
+                                    ev.ocr_last = Some(Instant::now());
+                                    if let Some(lines) = eye_read_text() {
+                                        eye_exit = Some(EyeExit::OcrHit(lines));
+                                    }
+                                }
+                            }
+                            _ => {
+                                // mtime 没动（或首帧未落）超时 → 杀重生。首帧
+                                // 预算放宽一倍（子进程冷启动 + 前 3 帧只统计）
+                                let stuck = if ev.mtime.is_none() {
+                                    2 * EYE_STUCK_SECS
+                                } else {
+                                    EYE_STUCK_SECS
+                                };
+                                if ev.mtime_seen.elapsed() >= Duration::from_secs(stuck) {
+                                    if ev.retries >= EYE_RETRIES {
+                                        eye_exit = Some(EyeExit::GiveUp("取景卡住了，取景关闭。"));
+                                    } else {
+                                        eprintln!("aginx-voice: eye stuck frame, respawn");
+                                        let _ = eye_respawn(ev);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(exit) = eye_exit {
+            if let Some(mut ev) = eye.take() {
+                eye_stop(&mut ev.child);
+            }
+            face::write(false);
+            match exit {
+                EyeExit::Hit(payloads) => {
+                    // 命中即自动走：配对码（超集，PairApply）/ WIFI: 码直连 /
+                    // 文本码念前 40 字——拉式，码到手就用
+                    let outs = vm.step(Ev::QrDone(Ok(payloads)));
+                    run_outs(&mut vm, outs, brain.as_ref(), &mut eye, &mut call);
+                }
+                EyeExit::OcrHit(lines) => {
+                    // 文字到手取景的活就干完了（#246 同律）：闭眼、上屏、念。
+                    let outs = vm.step(Ev::OcrDone(Ok(lines)));
+                    run_outs(&mut vm, outs, brain.as_ref(), &mut eye, &mut call);
+                }
+                EyeExit::GiveUp(msg) => {
+                    let _ = vm.inject_say(msg);
+                }
+            }
+        }
+
+        // ---- 通话子进程（刀5b）：退出即分类终局回喂 ----
+        if call.is_some() {
+            let exited = call.as_mut().and_then(|cv| cv.child.try_wait().ok()).flatten().is_some();
+            if exited {
+                let mut cv = call.take().expect("call");
+                let end = call_classify(&mut cv);
+                face::write(false);
+                let outs = vm.step(Ev::CallDone(end));
+                run_outs(&mut vm, outs, brain.as_ref(), &mut eye, &mut call);
+            }
+        }
+
+        // ---- #282 开机等网（5s 节拍非阻塞；行易主/窗口尽即静默退役） ----
+        boot_net_tick(&mut boot_net);
+
+        // ---- 口令等待心跳（面法B）：真实流逝喂进状态机 ----
+        // run_outs 可能阻塞数秒（TTS/brain 往返）——喂真实 dt，等待按
+        // 人间的钟作废。空等 = 空返回，无输出零成本。
+        let now = Instant::now();
+        let outs = vm.step(Ev::Tick(
+            now.duration_since(last_tick).as_millis() as u32
+        ));
+        last_tick = now;
+        if !outs.is_empty() {
+            run_outs(&mut vm, outs, brain.as_ref(), &mut eye, &mut call);
+        }
+    }
+}
+
+/// 静音闸 / ASR 失败：只上脸。Say 不出声（拉式语音：点名才 TTS）。
+fn miss_on_face() {
+    face::set_line(Some("没听懂"));
+    face::write(false);
+}
+
+/// 嘴：本地 aginx-tts 优先（M42d，离线即产品），失败/缺件落 brain TTS。
+fn say(text: &str, brain: Option<&audio::Brain>) {
+    if audio::local_voice_ready() {
+        match audio::local_speak(text) {
+            Ok(()) => return,
+            Err(e) => eprintln!("aginx-voice: local tts {e}"),
+        }
+    }
+    if let Some(b) = brain {
+        if let Err(e) = b.speak(text) {
+            eprintln!("aginx-voice: tts {e}");
+        }
+    } else {
+        eprintln!("aginx-voice: (mute) {text}");
+    }
+}
+
+/// 耳：本地 aginx-asr 优先，失败/缺件落 brain ASR（brain 对本机采集链幻听，
+/// 见 audio.rs 法医收据——本地在位时实际不会走到云）。
+fn hear(wav: &[u8], brain: Option<&audio::Brain>) -> Result<String, String> {
+    if audio::local_voice_ready() {
+        // 本地在就不走云：redfin 收据是云 ASR 对未校准麦幻听。 // D14-exempt: device receipt note
+        return audio::local_asr(wav);
+    }
+    match brain {
+        Some(b) => b.asr(wav),
+        None => Err("no asr backend".into()),
+    }
+}
+
+/// 落地状态机输出。拉式语音：Say 只上脸（行已在 vm.lines 里，末尾统一
+/// face::write），Speak 才走 TTS；Act → 执行并把结果喂回状态机。eye：
+/// 眼取景所有权借用——Act::Eye/EyeClose 由协议出生（缺网自动睁眼、取消
+/// 自动闭眼），VolUp/音量下走同两个助手。call：通话子进程所有权借用
+/// （刀5b）——Act::Call spawn 后由主循环轮询。
+#[allow(clippy::too_many_arguments)]
+fn run_outs(
+    vm: &mut Vm,
+    outs: Vec<Out>,
+    brain: Option<&audio::Brain>,
+    eye: &mut Option<EyeView>,
+    call: &mut Option<CallView>,
+) {
+    let mut followups: Vec<Ev> = Vec::new();
+    for o in outs {
+        match o {
+            Out::Say(s) => {
+                // v4：话术=光标面打字文本（屏幕对话）+ stderr 日志（真源）。
+                // 脸不再序列化 lines 历史，终值即当前一行。
+                eprintln!("aginx-voice: say {s}");
+                face::set_line(Some(&s));
+            }
+            Out::Speak(s) => {
+                eprintln!("aginx-voice: speak {s}");
+                face::set_line(Some(&s));
+                face::write(eye.is_some());
+                say(&s, brain);
+            }
+            Out::Act(a) => match a {
+                Act::NetConnect => {
+                    // 机器干活：先看现状，再试记忆里的网，都不行才睁眼要码
+                    face::write(eye.is_some());
+                    followups.push(Ev::NetState(net_check()));
+                }
+                Act::Join { ssid, psk } => {
+                    face::write(eye.is_some());
+                    followups.push(Ev::JoinDone(join_wifi(&ssid, &psk)));
+                }
+                Act::PairApply { bundle } => {
+                    face::write(eye.is_some());
+                    let r = pair_apply(&bundle);
+                    if r.is_ok() {
+                        // v4: 剧场已退役——镜头先收（眼视图还占着面板），
+                        // PairDone 就地喂（收尾句照常出声，Say 落 face）。
+                        eye_shut(vm, eye);
+                        let outs = vm.step(Ev::PairDone(r));
+                        run_outs(vm, outs, brain, eye, call);
+                    } else {
+                        followups.push(Ev::PairDone(r));
+                    }
+                }
+                Act::Eye => eye_start(vm, eye),
+                Act::EyeClose => eye_shut(vm, eye),
+                Act::QrScan => {
+                    if eye.is_some() {
+                        // M47⑤ 互斥门：取景轮询已在逐帧解，等命中即可——
+                        // 这里另起 cam-shot 会撞 sensor
+                        let _ = vm.inject_say("取景开着，对准码就行。");
+                        continue;
+                    }
+                    face::write(false);
+                    let r = scan_qr();
+                    if let Err(e) = &r {
+                        eprintln!("aginx-voice: qr {e}");
+                    }
+                    followups.push(Ev::QrDone(r));
+                }
+                Act::Ocr => {
+                    // 09-10 盲拍退役：对准看不见是双栏收据失败根因（40-50cm
+                    // 外整页文字 10px 级，det 不可读）。念读也走取景器——
+                    // 眼开着就是机器在看：立即试一发不等 3s 节拍，没中交给
+                    // 轮询续命；眼没开就开眼（连网同款拉式）。扫描中不试
+                    // 立即一发（散焦帧=乱字假命中）——轮询等 focus 自己续。
+                    if let Some(ev) = eye.as_mut() {
+                        let _ = vm.inject_say("取景开着，对准文字就行。");
+                        if eye_af_ready() {
+                            ev.ocr_last = Some(Instant::now());
+                            if let Some(lines) = eye_read_text() {
+                                if let Some(mut ev) = eye.take() {
+                                    eye_stop(&mut ev.child);
+                                }
+                                face::write(false);
+                                followups.push(Ev::OcrDone(Ok(lines)));
+                            }
+                        }
+                    } else {
+                        eye_start(vm, eye);
+                    }
+                }
+                Act::Status => {
+                    // V5（09-10）：状态与其他 Say 同律——只上脸+日志，不出声；
+                    // 要听跟「你说给我听」。这里原是全程序唯一一个 Say 还走
+                    // TTS 的漏网口。
+                    let o = vm.inject_say(&status_text());
+                    if let Out::Say(s) = o {
+                        eprintln!("aginx-voice: say {s}");
+                        face::set_line(Some(&s));
+                    }
+                }
+                Act::PowerExec { action } => {
+                    // 面法B：确认话术已由 Speak 行播放（local_speak 阻塞——
+                    // 放音走完才到这）。再留一拍让尾音落稳，然后交
+                    // aginx-reboot（自己 sync）。daemon 不退出——随整机一起走。
+                    // 日志只记动作，永不记口令。
+                    std::thread::sleep(Duration::from_millis(1500));
+                    let arg = match action {
+                        PowerAction::Poweroff => "poweroff",
+                        PowerAction::Reboot => "reboot",
+                    };
+                    eprintln!("aginx-voice: power exec {arg}");
+                    let _ = Command::new("/usr/bin/aginx-reboot").arg(arg).spawn();
+                }
+                Act::Call { target } => {
+                    // 刀5b 零脑直拨：查名录 → spawn 拨出腿。通话中的
+                    // 结构性防御（PTT/屏上按住在通话中都进不来，这里
+                    // 是万一）：报忙不开第二路。
+                    face::write(eye.is_some());
+                    if call.is_some() {
+                        let _ = vm.inject_say("正在通话中。");
+                        continue;
+                    }
+                    match call_lookup(&target) {
+                        None => {
+                            followups.push(Ev::CallDone(CallEnd::NoNumber { name: target }));
+                        }
+                        Some(uri) => match call_spawn(&uri) {
+                            Ok((child, out)) => {
+                                eprintln!("aginx-voice: call {target} -> {uri}");
+                                *call = Some(CallView {
+                                    child,
+                                    out,
+                                    target,
+                                    since: Instant::now(),
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("aginx-voice: call {e}");
+                                followups.push(Ev::CallDone(CallEnd::Failed));
+                            }
+                        },
+                    }
+                }
+                Act::Chat(text) => {
+                    face::write(eye.is_some());
+                    let hit = roster_hit(&text);
+                    if let Some(n) = &hit {
+                        eprintln!("aginx-voice: roster {n}");
+                    }
+                    // 刀4 页=会话：路由靶=花名册点名（显式意图）> 页卡
+                    // session（屏上 hold 带来的页靶）> 母体 me。页上追问
+                    // 由 term 写的当前页卡路径指路；PTT/首页按住=新任务。
+                    let page = CHAT_PAGE.lock().unwrap().take();
+                    let sess = hit.clone().or_else(|| {
+                        page.as_deref()
+                            .and_then(screen::card_session)
+                            .or_else(|| Some("system".to_string()))
+                    });
+                    if let Some(s) = &sess {
+                        eprintln!("aginx-voice: session {s}");
+                    }
+                    let mut front_ok = true;
+                    let reply = match chat_front(&text, sess.as_deref()) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            front_ok = false;
+                            eprintln!("aginx-voice: front {e}");
+                            "现在连不上母体。固定说法还在：连接无线网络，或扫码，或念一下。".to_string()
+                        }
+                    };
+                    // 刀D done 信封：信封 → 浏览器按模板出页；非 JSON →
+                    // reply 模板兜底。缺模板报母体安排写一次并登记。
+                    // 刀1 复修（09-24）：前台没答上（地板话）不开页——失败
+                    // 回合照样 /open 会在用户已划走结果页后 90s 内又把屏抢
+                    // 回去（「还是回不到主页」拉锯根因）。地板话只上脸+说。
+                    let (line, missing, shown) = if front_ok {
+                        screen::show_reply(&text, &reply)
+                    } else {
+                        (reply.clone(), None, None)
+                    };
+                    if let Some((tpl, known)) = missing {
+                        report_missing_template(&tpl, &known);
+                    }
+                    // 刀4 页=卡=会话：页开成了才落账——新任务新卡，页上
+                    // 追问原地重写同卡；前台没答上（地板话）不落卡。
+                    if front_ok {
+                        if let Some(sh) = shown {
+                            let s = sess.unwrap_or_else(|| "system".into());
+                            if let Some(p) = screen::save_card(
+                                &screen::cards_dir(),
+                                page.as_deref(),
+                                &text,
+                                &sh.template,
+                                &sh.data,
+                                &s,
+                            ) {
+                                screen::note_page(&p);
+                            }
+                        }
+                    }
+                    // 拉式：回复上脸不出声，点名（你说给我听）才 Speak。
+                    // #283 问句常驻：行=「问句\n上脸句」——信封时上脸句是
+                    // say 摘要，脸行永远不 dump JSON。
+                    eprintln!("aginx-voice: say {line}");
+                    face::set_line(Some(&format!("{text}\n{line}")));
+                    face::stage_result();
+                }
+            },
+        }
+    }
+    // 例行刷脸只在无站立结果时做：tick 超时/纯 say 再入 run_outs 不得踩
+    // 站立页（结果页不超时=产品线；v4⑥ 真人第二雷：live 几秒后必 teardown
+    // 即此尾写所为）。失效只归新用户动作（PTT down/闭眼等显式 face::write）。
+    if !face::result_standing() {
+        face::write(eye.is_some());
+    }
+    for ev in followups {
+        let outs = vm.step(ev);
+        run_outs(vm, outs, brain, eye, call);
+    }
+    // v4⑥ 翻旗点（全程序唯一）：本回合若有 Chat 暂存了收尾，这里统一
+    // 翻 result:true——在出口 face::write 清旗之后、followups 跑完之后。
+    face::flush_pending();
+}
+
+/// 开眼（VolUp 与协议 Act::Eye 同一条路）。已开=守门话不双开——双会话
+/// 撞 sensor 必翻车，相机就这一个持有者。
+fn eye_start(vm: &mut Vm, eye: &mut Option<EyeView>) {
+    if eye.is_some() {
+        let _ = vm.inject_say("取景开着，对准码或文字。");
+        return;
+    }
+    // 上一会话的 AF 状态是残影（focus 撑着 OCR 闸）——新会话从 cam-shot
+    // 落笔重读。子进程起播前必写（scan/none），帧到了闸必已就位。
+    let _ = std::fs::remove_file(face::AF_STATE);
+    match eye_spawn() {
+        Ok(child) => {
+            *eye = Some(EyeView {
+                child,
+                since: Instant::now(),
+                mtime: None,
+                mtime_seen: Instant::now(),
+                last_qr: Instant::now(),
+                ocr_last: None,
+                retries: 0,
+            });
+            let _ = vm.inject_say("取景中，对准码或文字。");
+        }
+        Err(e) => {
+            eprintln!("aginx-voice: eye spawn {e}");
+            let _ = vm.inject_say("相机没起来，再按一次重试。");
+        }
+    }
+}
+
+/// 闭眼（VolUp 再按、音量下、协议 Act::EyeClose=取消的落地点）。没开=空转。
+fn eye_shut(vm: &mut Vm, eye: &mut Option<EyeView>) {
+    if let Some(mut ev) = eye.take() {
+        eye_stop(&mut ev.child);
+        let _ = vm.inject_say("取景已关。");
+    }
+}
+
+// ---------------- 执行件 ----------------
+
+/// 自由文本 → 母体/新前台（N2②）。spawn VOICED_FRONT 的路由器
+/// （`aginx agent send`——不带名字=住当前光标），成功 stdout 就是回复
+/// 文本；挂死有预算（wait_limited kill）。AGINX_SOCK 由环境继承。
+/// 花名册点名（v4③ v0，D11）：助理=workflows 目录（母体迁移后新几何，
+/// FS.md），目录即注册——voice 读与 server 同一优先级表（AGINX_HOME >
+/// AGINX_CARRIER_HOME > /home，母体 types config.rs home_dir 同源；不走
+/// HOME 推导——voice 的 HOME 与 term 一样不作数）。transcript 含助理名
+/// 子串 = 显式点名，不命中不点名落母体（母体 resolve_send 不点名臂自己
+/// 派活，#285）。字典序取首个命中；ASR 转写不保证名字还原，v0 宁落母体
+/// 不误投。
+fn roster_hit_in(root: &std::path::Path, text: &str) -> Option<String> {
+    let mut names: Vec<String> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names.into_iter().find(|n| text.contains(n.as_str()))
+}
+
+fn roster_hit(text: &str) -> Option<String> {
+    let root = match std::env::var("AGINX_HOME") {
+        Ok(h) if !h.is_empty() => std::path::PathBuf::from(h),
+        _ => match std::env::var("AGINX_CARRIER_HOME") {
+            Ok(h) if !h.is_empty() => std::path::PathBuf::from(h),
+            _ => std::path::PathBuf::from("/home"),
+        },
+    };
+    roster_hit_in(&root.join("workflows"), text)
+}
+
+fn chat_front(text: &str, name: Option<&str>) -> Result<String, String> {
+    let bin = front_bin().ok_or_else(|| "VOICED_FRONT not set".to_string())?;
+    let mut args: Vec<&str> = vec!["agent", "send"];
+    if let Some(n) = name {
+        args.push(n);
+    }
+    args.push(text);
+    let mut child = Command::new(&bin)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn {bin}: {e}"))?;
+    audio::wait_limited(&mut child, FRONT_BUDGET_SECS)
+        .map_err(|e| format!("front {e}"))?;
+    let out = child.wait().map_err(|e| e.to_string())?;
+    let mut stdout = String::new();
+    if let Some(mut r) = child.stdout.take() {
+        use std::io::Read;
+        let _ = r.read_to_string(&mut stdout);
+    }
+    let reply = stdout.trim().to_string();
+    if !out.success() {
+        return Err(format!("exit {}", out.code().unwrap_or(-1)));
+    }
+    if reply.is_empty() {
+        return Err("empty reply".into());
+    }
+    Ok(reply)
+}
+
+/// 缺模板报母体（HANDOFF-显示：没模板时告诉母体，由母体安排模型写
+/// 一次并登记）。v0 通道=send me；同一名模板本进程只报一次——母体没
+/// 补好之前反复点同一张卡不该刷屏。fire-and-forget：母体回文不上脸
+/// 不念，那是母体自己的派活收尾。90s 预算够写一个模板+登记。
+fn report_missing_template(tpl: &str, known: &[String]) {
+    static REPORTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let mut seen = REPORTED
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if !seen.insert(tpl.to_string()) {
+        return;
+    }
+    let msg = format!(
+        "浏览器缺模板「{tpl}」：/open 返回 unknown_template，在册只有 {}。请安排写一次 {tpl}.html 放进 /var/lib/aginxbrowser/templates/ 并登记 registry.json。",
+        known.join("、")
+    );
+    eprintln!("aginx-voice: report missing template {tpl}");
+    if let Err(e) = chat_front(&msg, Some("system")) {
+        eprintln!("aginx-voice: report: {e}");
+    }
+}
+
+/// Act::NetConnect 判定（命令优先 2026-09-06）：有 IP=Up；无 IP 先试
+/// /etc/wifi.conf 记忆（net-bringup 同形 KEY=VALUE），连上=Up、连不上=
+/// ConfFail；没记录=NoConf。ConfFail/NoConf 由协议接 Act::Eye——机器自
+/// 己把下一步走完，人只管对准码。
+fn net_check() -> NetState {
+    if wlan0_ip().is_some() {
+        return NetState::Up;
+    }
+    match read_wifi_conf() {
+        Some((ssid, psk)) => match join_wifi(&ssid, &psk) {
+            Ok(_) => NetState::Up,
+            Err(e) => {
+                eprintln!("aginx-voice: conf join {ssid}: {e}");
+                NetState::ConfFail
+            }
+        },
+        None => NetState::NoConf,
+    }
+}
+
+/// wlan0 的 IPv4（回环除外）。None = 没网。剥 CIDR 后缀（设备 ip 输出
+/// `inet 192.168.3.93/24`——带着 /24 会让 AGINX_CALL_BIND 的 IpAddr
+/// 解析炸，刀5c 预检收据）。
+fn wlan0_ip() -> Option<String> {
+    let out = Command::new("ip")
+        .args(["-4", "addr", "show", "wlan0"])
+        .output()
+        .ok()?;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(rest) = line.trim().strip_prefix("inet ") {
+            if let Some(ip) = rest.split_whitespace().next() {
+                let ip = ip.split('/').next().unwrap_or(ip);
+                if ip != "127.0.0.1" {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// /etc/wifi.conf 读取（net-bringup 同形：ssid=/psk=，容忍 CR）。None =
+/// 没有身份记录。
+fn read_wifi_conf() -> Option<(String, String)> {
+    let txt = std::fs::read_to_string("/etc/wifi.conf").ok()?;
+    let mut ssid = None;
+    let mut psk = String::new();
+    for line in txt.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(v) = line.strip_prefix("ssid=") {
+            ssid = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("psk=") {
+            psk = v.to_string();
+        }
+    }
+    Some((ssid?, psk))
+}
+
+/// Act::PairApply（M42c 一眼自举的机器侧全流程）委外 `/var/bin/aginx-pair
+/// apply`（C3；刀F 起包面）：payload 一行进 stdin——argv 恒两词，psk/三键永不进
+/// /proc/*/cmdline。join+IP 轮询+落 wifi.conf、env 三键合并、快速校时、
+/// internet 探测、母体两单元 restart-ready、boot.state 网四行定点刷新全
+/// 在那一侧；汇总行（stdout 首行）回来作报告话。秘密只进 env 文件
+/// （0600），两侧日志都永不记值。预算 240s（join 90s + ntpd 20s + 两单元
+/// 各 10s ready，余量给首启冷路）。**不重启 aginx-voice**——重启=自杀，
+/// 本地语音离线路径不依赖 env，下次 boot 自然带上。
+const PAIR_APPLY_BUDGET_SECS: u32 = 240;
+
+fn pair_apply(bundle: &aginx_qr::PairBundle) -> Result<String, String> {
+    use std::io::Write as _;
+    let mut child = Command::new("/var/bin/aginx-pair")
+        .arg("apply")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("aginx-pair spawn: {e}"))?;
+    {
+        let mut si = child.stdin.take().ok_or("aginx-pair stdin")?;
+        si.write_all(format!("{}\n", bundle.payload()).as_bytes())
+            .map_err(|e| format!("aginx-pair stdin: {e}"))?;
+        // 块结束 drop 写端 —— apply 读到 EOF 收行
+    }
+    audio::wait_limited(&mut child, PAIR_APPLY_BUDGET_SECS)
+        .map_err(|e| format!("aginx-pair {e}"))?;
+    // 汇总行短（≤一屏行），pipe 缓冲装得下；子已退，读到 EOF 即回
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("aginx-pair read: {e}"))?;
+    let line = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if line.is_empty() {
+        return Err("aginx-pair 没给汇总行".into());
+    }
+    Ok(line)
+}
+
+/// 拍照解 QR（M42b 眼分支）。尝试阶梯：默认曝光 ×3 → 慢模式+增益兜底。
+///
+/// 2026-09-04 设备收据定形：冷启动后头几次 cam-shot 调用整段是废片
+/// （IOMMU/流会话热身——sweep 10 连拍第 3 发才中），同一轮内 --frames 3
+/// 只是帧内曝光收敛，救不了会话级废片，所以要**多次调用**而不是多帧；
+/// 慢门+gain8 档三连败（暗/糊），只配末位。每轮独立留档（aginx-voice-qrN.jpg），
+/// 收据可逐轮复盘。cam-shot 挂死有预算（wait_limited kill）。
+const QR_BUDGET_SECS: u32 = 15;
+
+fn scan_qr() -> Result<Vec<String>, String> {
+    let mut last_err = String::new();
+    // (轮次从 1 计) — 第 4 轮才是慢门兜底
+    for round in 1..=4u32 {
+        let t0 = Instant::now();
+        let qr_jpg = format!("/tmp/aginx-voice-qr{round}.jpg");
+        let mut cmd = Command::new("/usr/bin/aginx-cam-shot");
+        cmd.args(["--stream", "--rear", "--frames", "3", "--jpeg-gray"])
+            .arg("--jpeg-out")
+            .arg(&qr_jpg)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if round == 4 {
+            // 末位兜底（机型参数 [quirks] qr_scan_args）：黑底白码贴纸、
+            // 夜间的最后一搏（本机是慢门模式+模拟增益档）
+            cmd.args(&hwd::load_or_exit().quirks.qr_scan_args);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("cam-shot spawn: {e}"))?;
+        if let Err(e) = audio::wait_limited(&mut child, QR_BUDGET_SECS) {
+            last_err = format!("cam-shot {e}");
+            continue; // 挂死被 kill——按失败重试
+        }
+        if !child.wait().map(|s| s.success()).unwrap_or(false) {
+            // 冷加载 IOMMU 间歇性失败是已知收据（M19c/M19b），直接重试
+            last_err = "cam-shot rc!=0".into();
+            continue;
+        }
+        // 解码（aginx-qr 进程，payload 一行一个）。output() 不带超时——解码
+        // 是 <300ms 量级的纯计算，等待预算都在拍照那侧
+        let dec = Command::new("/var/bin/aginx-qr").arg(&qr_jpg).output();
+        match dec {
+            Ok(out) if out.status.success() => {
+                let payloads = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                if !payloads.is_empty() {
+                    eprintln!(
+                        "aginx-voice: qr round {round}, {:.1}s",
+                        t0.elapsed().as_secs_f32()
+                    );
+                    return Ok(payloads);
+                }
+                last_err = "没找到二维码".into();
+            }
+            Ok(_) => last_err = "aginx-qr rc!=0".into(), // exit 1 = 没码，也重试
+            Err(e) => last_err = format!("aginx-qr spawn: {e}"),
+        }
+    }
+    Err(last_err)
+}
+
+/// M47⑤ 眼取景常驻子进程：--forever cam-shot，全屏竖帧原子发布（tmp+rename
+/// 由 cam-shot 自己做）。**双产物**（M47⑤c）：--raw-out eye.raw 每帧出
+/// RGB565（term 直读免解码，显示 ~12-15fps）；--jpeg-every-ms 500 把编码
+/// （0.125s/帧@预览宽，实测 2026-09-05——8fps 天花板的全部根因）摊薄成
+/// 慢车道副产物，只剩 QR 在读 eye.jpg（2Hz 限频正好对上）。--aspect 由
+/// [panel] 拼出 = 整屏（2026-09-05 用户收据「界面要做成全屏」），term 侧
+/// eye_box 同样出自 [panel]（launch.rs 测试读同一档案守着）——布局属性由
+/// 本粘合层显式注入，不共享 crate。AEC 状态由 cam-shot 落
+/// /run/aginx-cam/aec.state，下次开眼首帧即正常亮度。
+///
+/// argv 分层（D14）：粘合层固定加平台旗标（--stream --rear --forever
+/// --aec --jpeg --jpeg-every-ms 500 + 两个输出落点 + --aspect）；机器尾
+/// （rot/preview/vf-window/nr）整串来自 [quirks] eye_stream_args——换机型
+/// 只改数据。
+///
+/// ⑤u 两个变化（A/B 2026-09-06）：取景关 NR、出片仍走全 look（全分辨率
+/// demosaic+面积均值已结构性砍掉颗粒，整面空间 NR 在这之上纯付帧时）；
+/// 子进程 stdout/stderr 不再进 null，落 /run/aginx-voice/cam.log（每次
+/// 开眼截断一份）——真实会话第一次可见 aec 走线与 vf: 链路心跳。
+///
+/// ⑤v-1（2026-09-06，P2 探针已证）：曝光门减半参数（vf-window）也在
+/// 机器尾里——aec_step 的 pending 门是 window+3 帧/步，收敛 ~1.9→~1.4s，
+/// fps 无损（P2 实跑 498 帧正常）。
+fn eye_spawn() -> Result<std::process::Child, String> {
+    let p = hwd::load_or_exit();
+    let aspect = format!("{}:{}", p.panel.width, p.panel.height);
+    let mut cmd = Command::new("/usr/bin/aginx-cam-shot");
+    cmd.args(["--stream", "--rear", "--forever", "--aec", "--jpeg"])
+        .arg("--jpeg-every-ms")
+        .arg("500")
+        .args(&p.quirks.eye_stream_args)
+        .arg("--aspect")
+        .arg(&aspect)
+        .arg("--jpeg-out")
+        .arg(face::EYE_JPG)
+        .arg("--af-state")
+        .arg(face::AF_STATE)
+        .arg("--raw-out")
+        .arg("/run/aginx-voice/eye.raw");
+    // ⑤u: 一个日志文件，开眼截断（tmpfs 限一次会话）；stderr 挂 stdout 的
+    // dup——共享偏移，2>&1 语义。开不了就退回 null：观察不能弄死眼。
+    let log = std::fs::File::create("/run/aginx-voice/cam.log").ok();
+    cmd.stdout(log.as_ref().and_then(|f| f.try_clone().ok()).map_or_else(
+        std::process::Stdio::null,
+        std::process::Stdio::from,
+    ));
+    cmd.stderr(log.map_or_else(std::process::Stdio::null, std::process::Stdio::from));
+    cmd.spawn().map_err(|e| format!("cam-shot spawn: {e}"))
+}
+
+/// 优雅停机（TERM-then-wait，2s 预算）：cam-shot --forever 的退出路径是
+/// SIGTERM → STREAMOFF teardown + aec.state 落盘；超时才 SIGKILL（std 的
+/// Child::kill() 只有 SIGKILL，所以先 libc::kill 发 TERM）。
+fn eye_stop(child: &mut std::process::Child) {
+    let pid = child.id() as i32;
+    if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) => break,
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// 取景帧解 QR（aginx-qr 独立进程，100-300ms 纯计算，last_qr 限频 2Hz）。
+/// 全屏裁法（2016×930 vs 旧 1530×1136）横 FOV -18%/纵 +32%，预览缩放
+/// 720/930 反而比旧 720/1136 大 1.22×——M42b 甜点模块在预览里更大，
+/// 仍在 quirc + Bradley 已证域（实测定终）。None = 没码/解码器不在——
+/// 取景继续等下一帧。
+fn eye_decode_qr() -> Option<Vec<String>> {
+    let out = Command::new("/var/bin/aginx-qr")
+        .arg(face::EYE_JPG)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None; // exit 1 = 没码，取景继续
+    }
+    let payloads: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    (!payloads.is_empty()).then_some(payloads)
+}
+
+/// AF 握手（cam-shot --af-state 落笔）：focus=终码已落 / fail=扫描中止 /
+/// none=未武装 AF——三种都可读；scan 或文件缺位 = 镜头在扫（或子进程
+/// 还没落笔），OCR 歇拍等焦。QR 不门控：配对收据全在 grace 窗的静息
+/// 焦上，开眼即解是老节奏。
+fn eye_af_ready() -> bool {
+    std::fs::read_to_string(face::AF_STATE)
+        .map(|s| {
+            let t = s.trim_start();
+            t.starts_with("focus") || t.starts_with("fail") || t.starts_with("none")
+        })
+        .unwrap_or(false)
+}
+
+/// 取景帧念字（ag-ocr 独立进程读 eye.jpg）。取景帧是 cam-shot 转正过的
+/// 竖图（sensor 裁切 + rot90 出片），文字正立——`--rot 0` 钉死，auto 的
+/// 90 首试在这白付一发 det。预算 8s：没字帧 det ~0.9s / 整页 ~1.7s，挂死
+/// 才轮到 kill。None = 没字/引擎不在——取景继续等下一拍。
+const OCR_EYE_BUDGET_SECS: u32 = 8;
+
+fn eye_read_text() -> Option<Vec<String>> {
+    use std::io::Read;
+    let mut child = Command::new("/var/bin/aginx-ocr")
+        .args(["--rot", "0"])
+        .arg(face::EYE_JPG)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut buf = String::new();
+    if let Some(mut so) = child.stdout.take() {
+        let _ = so.read_to_string(&mut buf); // 输出 <64KB 管道缓冲，不会死锁
+    }
+    if audio::wait_limited(&mut child, OCR_EYE_BUDGET_SECS).is_err() {
+        eprintln!("aginx-voice: ocr hung, killed");
+        return None;
+    }
+    match child.wait().map(|st| st.code()).unwrap_or(None) {
+        Some(0) => {
+            let lines: Vec<String> = buf
+                .lines()
+                .map(|l| l.split('\t').next().unwrap_or("").to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            (!lines.is_empty()).then_some(lines)
+        }
+        Some(1) => None, // 没字：取景继续
+        _ => {
+            eprintln!("aginx-voice: ag-ocr rc=2");
+            None
+        }
+    }
+}
+
+/// net-join wlan0 ssid（PSK 走 AGINX_WIFI_PSK env，#467：argv 全局可读），
+/// 然后读 wlan0 的 IPv4。
+/// net-join 只装钥匙；租约靠 udhcpc（net-bringup/net-rejoin 同款分法，
+/// 2026-09-09 蛋首配收据：关联成而 IP 永不来——voice 旧路是被 net-watch
+/// 的 net-rejoin 兜住的）。地址已在（开机路径跑过 udhcpc）就跳过。
+fn join_wifi(ssid: &str, psk: &str) -> Result<String, String> {
+    let mut child = Command::new("/usr/bin/aginx-net-join")
+        .args(["wlan0", ssid])
+        .env("AGINX_WIFI_PSK", psk)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn: {e}"))?;
+    audio::wait_limited(&mut child, JOIN_BUDGET_SECS).map_err(|e| format!("wifi-join {e}"))?;
+    // 租约腿（net-bringup 同款参数）；地址已在就跳过，幂等不重试。
+    if wlan0_ip().is_none() {
+        let mut dhcp = Command::new("/bin/udhcpc")
+            .args(["-i", "wlan0", "-n", "-q", "-t", "10", "-T", "3"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("udhcpc spawn: {e}"))?;
+        audio::wait_limited(&mut dhcp, 40).map_err(|e| format!("udhcpc {e}"))?;
+    }
+    // dhcp 在 wifi-join 里；地址落不落直接看
+    for _ in 0..10 {
+        if let Some(ip) = wlan0_ip() {
+            persist_wifi(ssid, psk);
+            return Ok(ip);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Err("没拿到地址".into())
+}
+
+/// 连上网后落 /etc/wifi.conf（M42g③）：0600、`ssid=`/`psk=` KEY=VALUE——
+/// 开机 net-bringup 与 net-watch 自愈都读它。语音序数/拼读、WIFI: 码、
+/// 眼取景三条连网路从此持久，重启不丢网。**失败不写**：坏密钥不落盘
+/// （wizard 撤回语义）；同网重连写同值幂等。
+/// #64 回退表：换值不覆写——altN_* 表与注释保留、旧当前网降级进表
+/// （wificonf::rewrite；读方=net-rejoin 回退腿，格式契约三处同源）。
+fn persist_wifi(ssid: &str, psk: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let existing = std::fs::read_to_string("/etc/wifi.conf").unwrap_or_default();
+    let conf = wificonf::rewrite(&existing, ssid, psk);
+    let tmp = "/etc/wifi.conf.tmp";
+    let ok = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(tmp)
+        .and_then(|mut f| f.write_all(conf.as_bytes()))
+        .is_ok();
+    if ok {
+        let _ = std::fs::rename(tmp, "/etc/wifi.conf");
+    } else {
+        eprintln!("aginx-voice: persist wifi.conf failed");
+    }
+}
+
+/// 状态一句话：时间 + 电池 + 网络。
+fn status_text() -> String {
+    let p = hwd::load_or_exit();
+    let time = Command::new("date")
+        .arg("+%H %M")
+        // 钟面真源是 ntpd 校的 UTC；显示时区从设备档案带进 date 的 env
+        // （bionic busybox 只认 POSIX TZ 串——无 tzdata，/etc/localtime
+        // 也不读，09-10 设备活体收据）。
+        .env("TZ", &p.tz)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            // 按整数解析自然去前导零（TTS 会把 0 也念出来）。字符串修剪法
+            // 在 00 点会连吞两位（"00点45分"→"点45分"，09-10 立案次日修）。
+            let mut it = s.split_whitespace();
+            let h: u32 = it.next()?.parse().ok()?;
+            let m: u32 = it.next()?.parse().ok()?;
+            Some(format!("{h}点{m}分"))
+        })
+        .unwrap_or_default();
+    // 只报连没连——IP 逐位念出来又长又难听（数字展开还多 10s 合成+播放）
+    let net = if wlan0_ip().is_some() { "网已连" } else { "没联网" };
+    match hwd::battery_pct(&p.paths.power_supply) {
+        Some(bat) => format!("{time}，电池{bat}%，{net}。"),
+        None => format!("{time}，{net}。"),
+    }
+}
+
+#[cfg(test)]
+mod roster_tests {
+    use super::roster_hit_in;
+
+    #[test]
+    fn roster_hit_matches_substring_sorted_first_dirs_only() {
+        let d = std::env::temp_dir().join(format!("aginx-roster-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("小喜")).unwrap();
+        std::fs::create_dir_all(d.join("阿福")).unwrap();
+        std::fs::write(d.join("zzz-not-avatar"), b"").unwrap();
+        // 子串命中
+        assert_eq!(roster_hit_in(&d, "帮小喜看看天气"), Some("小喜".into()));
+        // 双命中 → 字典序首个（小 U+5C0F < 阿 U+963F）
+        assert_eq!(roster_hit_in(&d, "小喜和阿福都在吗"), Some("小喜".into()));
+        // 不命中 → None（落母体）
+        assert_eq!(roster_hit_in(&d, "今天天气怎么样"), None);
+        // 文件不是化身（目录即注册）
+        assert_eq!(roster_hit_in(&d, "读一下 zzz-not-avatar"), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

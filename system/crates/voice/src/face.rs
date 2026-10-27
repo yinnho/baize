@@ -1,0 +1,112 @@
+//! 屏显对话面（M42a）：aginx-voice 是 /run/aginx-voice/face 的唯一写者，原子换名写；
+//! aterm 轮询 mtime 读（同 /run/aginx-term.inject 的先例）。触摸屏=纯显示器，
+//! 脸不归 aginx-voice 画、也不归 aginx-voice 点——没有可点的东西。
+//!
+//! M42g 眼取景：音量+ 按下 → eye=true 且逐帧换写 eye.jpg（同目录同原子法），
+//! term 主区从对话行切为渲染这张帧（成果区第一实例）——取景画面本身就是
+//! 「眼睛睁开了」，人看着画面瞄准，识别成功自动进对话。
+
+use serde::Serialize;
+use std::fs;
+use std::path::Path;
+use std::sync::Mutex;
+
+pub const FACE_DIR: &str = "/run/aginx-voice";
+pub const FACE_FILE: &str = "/run/aginx-voice/face";
+/// term 按住说话圆：文件在 = 按下，消失 = 松开。与音量下 PTT 并列。
+pub const HOLD_FILE: &str = "/run/aginx-voice/hold";
+/// 眼取景当前帧（M42g）。voice 原子换名写，term 轮询 mtime 重渲染。
+pub const EYE_JPG: &str = "/run/aginx-voice/eye.jpg";
+/// AF 握手（cam-shot --af-state 落笔）：scan=扫描中 / focus=终码落 /
+/// fail=扫描中止 / none=未武装。voice 据此门控取景 OCR。
+pub const AF_STATE: &str = "/run/aginx-voice/af.state";
+
+// 开机剧情 v4：line = 打字文本（ASR transcript v4③ / 文本降级回复，term
+// 本地 ~90ms/char 打字机，换串即换行）。
+static BOOT_LINE: Mutex<Option<String>> = Mutex::new(None);
+
+/// 回合完成旗站立中（结果已交浏览器或降级文本——真人实测雷：结果
+/// 出来后 tick 超时/纯 say 再入 run_outs 的例行刷脸会把站立行踩掉）。
+/// 唯一置位点 write_doc(result=true)，任何 result=false 落盘即清。
+static RESULT_STANDING: Mutex<bool> = Mutex::new(false);
+
+/// 本回合已收尾待翻旗（刀D：Chat 臂不早翻——本回合后续 face::write 会
+/// 清掉早翻的旗，统一挪到 run_outs 尾部 flush_pending）。
+static PENDING: Mutex<bool> = Mutex::new(false);
+
+/// 换打字文本。前缀延长由 term 识别并续打，其余换串从头打。
+pub fn set_line(line: Option<&str>) {
+    *BOOT_LINE.lock().unwrap() = line.map(str::to_string);
+}
+
+/// 打字文本当前值（#282 开机等网行所有权判据）：写入方读回自己是否还
+/// 在台上——用户一说话 transcript 就顶掉等待行，watch 即知让位。
+pub fn current_line() -> Option<String> {
+    BOOT_LINE.lock().unwrap().clone()
+}
+
+#[derive(Serialize)]
+pub struct FaceDoc {
+    /// 眼取景中：Mode::Eye 整屏取景
+    pub eye: bool,
+    /// 回合已完成（刀D）：结果已交浏览器（show.html 接管屏幕）或降级为
+    /// 文本。term 据此停「在想」动画、持帧不超时；新用户动作（PTT down/
+    /// 闭眼）face::write 即清。
+    pub result: bool,
+    /// 打字文本（transcript/文本回复，'\n' 强制换行）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+}
+
+/// V3（09-10）：`state` 字段退役——命令优先重写后它恒 "idle"（唯一例外
+/// powerwait 也不上脸），term 的 FaceDoc 从来只读 eye/result/line（serde
+/// default，多余字段透明忽略）。
+fn write_doc(eye: bool, result: bool) {
+    *RESULT_STANDING.lock().unwrap() = result;
+    let _ = fs::create_dir_all(FACE_DIR);
+    let doc = FaceDoc {
+        eye,
+        result,
+        line: BOOT_LINE.lock().unwrap().clone(),
+    };
+    let tmp = format!("{FACE_FILE}.tmp");
+    if let Ok(json) = serde_json::to_vec(&doc) {
+        if fs::write(&tmp, &json).is_ok() {
+            let _ = fs::rename(&tmp, FACE_FILE);
+        }
+    }
+}
+
+pub fn write(eye: bool) {
+    write_doc(eye, false);
+}
+
+/// 回合完成旗（刀D）：Chat 臂收尾 stage_result 暂存，run_outs 尾部
+/// flush_pending 统一翻——result=true 让 term 停动画、持帧。
+pub fn write_result() {
+    write_doc(false, true);
+}
+
+/// Chat 臂收尾：暂存待翻旗。不早翻——本回合后续 face::write 会清掉。
+pub fn stage_result() {
+    *PENDING.lock().unwrap() = true;
+}
+
+/// run_outs 尾部（followups 循环后）调用：全程序唯一翻旗点。无暂存=空转。
+pub fn flush_pending() {
+    let mut p = PENDING.lock().unwrap();
+    if *p {
+        *p = false;
+        write_result();
+    }
+}
+
+/// 回合完成旗站立中：run_outs 尾部例行刷脸的门。
+pub fn result_standing() -> bool {
+    *RESULT_STANDING.lock().unwrap()
+}
+
+/// aginx-term/调试读面
+pub fn read() -> Option<String> {
+    fs::read_to_string(Path::new(FACE_FILE)).ok()
+}

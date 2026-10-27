@@ -1,0 +1,791 @@
+#!/usr/bin/env bash
+# Build the N4 AginxOS rootfs image — the new repo owns the bake chain.
+#
+# Assembles the tree from: the recipe in ./rootfs (etc + aginx-* faces +
+# libexec daemons + generic C sources), new-repo musl binaries (zigbuild),
+# and DEVICE ASSETS under .local/device/${DEVICE}/ (vendor ramdisk, voice/OCR
+# stacks, dropbear, radio blobs, the frozen aginxos trampoline pair — see
+# devices/${DEVICE}/boot/assets.md for the layout and regeneration paths);
+# N5②: every renamed-at-install CLI is rebuilt here instead; the old `ag`
+# router, ag-* shims, carrier daemon and relay do NOT enter the image
+# (切净).
+#
+# Flash with:  fastboot flash userdata out/rootfs.img
+# Boot needs a vendor_boot packed with ROOTFS=1
+# (devices/${DEVICE}/boot/pack-vendor-boot.sh, on the vendor-boot style).
+#
+# Note: mke2fs -d records the building user's uid (501 on macOS) as owner.
+# rcS chowns everything back to 0:0 on first boot — do not "fix" that here.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# D14 机型是数据：DEVICE 选 devices/<codename>/（device.toml + modules.txt +
+# bringup/ + cam/）。默认 redfin 只在「不传就烤首目标」的意义上成立——目录
+# 缺失即 die，绝不猜、绝不兜底第二台机的数据。
+DEVICE="${DEVICE:-redfin}"
+DEVDIR="${ROOT}/devices/${DEVICE}"
+test -f "${DEVDIR}/device.toml" \
+  || { echo "unknown device '${DEVICE}' — no ${DEVDIR}/device.toml (see devices/README.md)" >&2; exit 1; }
+ASSETS="${ROOT}/.local/device/${DEVICE}"
+RAMDISK="${ASSETS}/vendor-ramdisk-root"
+TRAMP="${ASSETS}/trampoline"
+# E4b（2026-09-13，#335 enchilada 节点机）：boot_style 是烤线分流闸。
+#   vendor-boot = redfin 形：vendor ramdisk + system/(adbd) + 冻结
+#     trampoline + cnss/modem 世界（preload/fake-sm/qrtr/radio）。
+#   raw-boot    = enchilada 形：boot.img 直读 userdata ext4，无 vendor
+#     世界——上述段全部门掉（段内资产本机不存在，硬跑只会烤进垃圾）。
+#   armbian-ride = 服务器盒形（2026-10-07，#66 W1）：目录骑乘卖家
+#     Armbian 启动链——raw-boot 的世界裁剪全继承，唯 qcom 固件世界
+#     不存在（无 modem、eth 内建）；rootfs 不进分区表，住卖家盘目录。
+# 读 device.toml 的既有字符串字段，schema 零变动（hwd deny_unknown_fields
+# 一代差铁律：加新键=在役老二进制硬退）。
+BOOT_STYLE="$(sed -n 's/^boot_style *= *"\([^"]*\)".*/\1/p' "${DEVDIR}/device.toml" | sed -n '1p')"
+[ -n "${BOOT_STYLE}" ] \
+  || { echo "FATAL: ${DEVDIR}/device.toml 缺 boot_style" >&2; exit 1; }
+case "${BOOT_STYLE}" in
+  vendor-boot|raw-boot|armbian-ride) ;;
+  *) echo "FATAL: ${DEVDIR}/device.toml boot_style='${BOOT_STYLE}' 未登记（vendor-boot|raw-boot|armbian-ride）" >&2; exit 1 ;;
+esac
+# 冻结 trampoline 对只服务于 M22 换根更新流；device.toml 有 [update] 节
+# 才烤（enchilada 无此节：升级=重刷 userdata，aginxos-init 无对价）。
+HAS_UPDATE=0
+grep -qE '^\[update(\.|\])' "${DEVDIR}/device.toml" && HAS_UPDATE=1
+RECIPE="${ROOT}/rootfs"
+TARGET="${ROOT}/target/aarch64-unknown-linux-musl/release"
+TREE="${TREE:-/tmp/aginxos-n4-rootfs}"
+IMG="${IMG:-${ROOT}/out/rootfs.img}"
+# 2 GB sparse-ish image (bake #18 data: 651M used; N4 drops carrier+relay).
+SIZE="${SIZE:-2g}"
+# L0 无头底座（刀4，2026-09-11，蛋案转正；#422 黑匣子服务器叙事）：
+# 镜像=内核+init+svc+网络+ssh+pkg，刷完就是一台活的 agent 节点。
+# aginx 树包、网关/密钥、SIP 嘴耳（asr/tts/voice）、频道/运维件全是包——
+# opt 附加在 etc 装配段按两层组装+签名进树（全 opt：provision 默认什么
+# 都不装）。裸机=黑匣子：联网+ssh 在；屏/PTT/相机脸线冻结，不进默认宣传。
+
+if [ "${BOOT_STYLE}" = "vendor-boot" ]; then
+  test -x "${RAMDISK}/system/bin/adbd" || { echo "missing ${RAMDISK} — see devices/${DEVICE}/boot/assets.md (run pack-vendor-boot.sh)" >&2; exit 1; }
+fi
+test -x "${RECIPE}/busybox" || { echo "missing ${RECIPE}/busybox recipe asset" >&2; exit 1; }
+MKE2FS="$(command -v mke2fs || true)"
+test -z "${MKE2FS}" && MKE2FS=/opt/homebrew/bin/mke2fs
+test -x "${MKE2FS}" || { echo "mke2fs not found (android-platform-tools provides it)" >&2; exit 1; }
+
+# First-gen musl binaries, renamed at install (D13). N5② emptied this
+# list down to the trampoline pair: every CLI the new repo has source for
+# (download/update/qr/done/secret + the earlier voice/wizard/term/svc/
+# pkg/sign wave) is rebuilt here instead; the trampoline stays frozen
+# deliberately (aginxos-init owns the userdata rootfs swap — swap the
+# swapper and the update flow has no rollback story).
+if [ "${HAS_UPDATE}" = "1" ]; then
+  for b in aginxos-init aginxos-agent; do
+    test -x "${TRAMP}/${b}" \
+      || { echo "missing ${b} — see devices/${DEVICE}/boot/assets.md (frozen trampoline pair)" >&2; exit 1; }
+  done
+fi
+
+# L0（刀4）：voice/ocr 的 bionic 件与模型树不再烤镜像——aginx-asr/
+# tts/ocr 三树包随清单走（真源 .local/device/redfin/{voice,ocr}，由
+# build-pkg.sh 打包，再生路径 devices/${DEVICE}/boot/assets.md）。
+
+echo "==> zigbuild 新仓 musl 件（缓存则秒过）"
+# 刀E（2026-09-12）：镜像 Rust 件 opt-level=z，env 挂在 zigbuild 调用上
+# （刀F 后单次调用）。
+# - 只动镜像线：build-pkg.sh 的包构建不吃这个 env（包 sha 与 manifest/
+#   镜像源耦���，改包的 codegen = 断 opt-in 门），故不用 Cargo.toml profile。
+# - 收据：十件剥后 7,227,608→6,099,392 B（−1,128,216B）；LTO+cg1 只再多
+#   68KB 且 qr/update 反涨，弃。设备冒烟：qr 解码 round-trip + 与在役件
+#   50 连发墙钟平手、update status 出全 boot 表、svc 行为逐位同。
+# L0 五件：pkg/svc/download/done/secret（刀4：router/server/runtime/
+# voice/term/gateway 出镜像走包；刀F：qr/pair/update 同律出镜像——
+# build-pkg.sh 烤，依赖身份进 opt-in 闭包）。
+# aginx-secret crate 双 bin，secretd 产物本线不装、由 aginx-secretd 包走）。
+(cd "${ROOT}" && CARGO_PROFILE_RELEASE_OPT_LEVEL=z cargo zigbuild --release --target aarch64-unknown-linux-musl \
+  -p aginx-pkg -p aginx-svc \
+  -p aginx-download -p aginx-done -p aginx-secret)
+
+
+# Package manifest rides SIGNED: the on-device default path requires a
+# detached sig or every `aginx-pkg sync` refuses (fail-closed). Content-
+# based check (git does not carry mtimes): resign when the sig is missing
+# or no longer verifies against the manifest (a machine with the pubkey
+# can prove staleness; without it we ship the committed sig as-is — it is
+# a public artifact, safe to commit). N4 note: this gate runs BEFORE the
+# recipe cp below, so a fresh resign lands in the image the same bake —
+# the first-gen script signed after the copy and could ship a stale sig.
+AGPKG_KEY=".local/keys/aginx.key"
+AGPKG_PUB=".local/keys/aginx.pub"
+AGPKG_MF="${RECIPE}/etc/agpkg.manifest"
+AGPKG_SIG="${RECIPE}/etc/agpkg.manifest.sig"
+AGPKG_NEED_SIGN=0
+[[ -f "${AGPKG_SIG}" ]] || AGPKG_NEED_SIGN=1
+if [[ "${AGPKG_NEED_SIGN}" -eq 0 && -f "${ROOT}/${AGPKG_PUB}" ]] \
+   && ! (cd "${ROOT}" && cargo run -q -p aginx-sign -- verify "${AGPKG_PUB}" "${AGPKG_MF}" >/dev/null 2>&1); then
+  AGPKG_NEED_SIGN=1
+fi
+if [[ "${AGPKG_NEED_SIGN}" -eq 1 ]]; then
+  [[ -f "${ROOT}/${AGPKG_KEY}" ]] || { echo "FATAL: ${AGPKG_MF} needs signing but ${AGPKG_KEY} is missing" >&2; exit 1; }
+  (cd "${ROOT}" && cargo run -q -p aginx-sign -- sign "${AGPKG_KEY}" "${AGPKG_MF}")
+  echo "==> signed ${AGPKG_MF} (commit the refreshed .sig)"
+fi
+
+rm -rf "${TREE}"
+mkdir -p "${TREE}"
+
+# Mountpoints (and /var/log — the only place boot evidence survives; the
+# kernel has no pstore, so /var/adbd.log is our cross-boot record).
+# /var/power + the seven /var/lib/aginx members (N5③: skills, units,
+# stamps, pkgfiles, done, secret, voice — the single state home; the old
+# agpkg/ag/voiced roots fold in via /etc/init.d/varlib-migrate): state-tar
+# members that must exist on a fresh image — busybox tar exits 1 on a
+# missing member, which the hardened aginx-update rightly treats as fatal
+# (observed 2026-09-03, bake #9). provision seeds them at runtime too;
+# varlib-migrate mkdir's on every boot as the belt to this pair of braces.
+# /var/tmp — NOT tmpfs (only /tmp is), yet nothing created it: bake #10's
+# fresh image shipped without it, provision's `>$LOG` redirect failed and
+# resync reported pkg-fail-with-no-log (observed 2026-09-03). aginx-update
+# also stage-builds its state tar there (M22 note).
+mkdir -p "${TREE}"/{dev,proc,sys,etc,home,media,mnt,opt,root,run,srv,tmp,var/log,var/power,var/tmp}
+mkdir -p "${TREE}"/var/lib/aginx/{skills,units,stamps,pkgfiles,done,secret,voice}
+
+# codex 家（#450 立法，2026-10-10 翻修正法）：不造 /root/.codex 桥——
+# 每条 spawn 腿自己钉家（kernel/安装链写条目 [command.env] CODEX_HOME=
+# <home>/.codex；引擎/工作流 spawn 带 HOME）。手动 ssh 腿裸跑 codex 落
+# 空家死循环=诚实报错，配方见 devices/README.md（CODEX_HOME 显式）。
+# 真源内容由 opt-in/provision 填 /home/.codex（config.toml+auth.json）。
+
+# Android pieces: /system (adbd + linker config + lib64) and the root-level
+# property/SELinux files adbd reads at startup.
+# raw-boot 无 vendor ramdisk 无 adbd——整段跳过（E4b 门；段内保持原缩进，
+# 让 redfin  diff 可读）。
+if [ "${BOOT_STYLE}" = "vendor-boot" ]; then
+cp -R "${RAMDISK}/system" "${TREE}/system"
+# 刀C system/ 死件考古（2026-09-12，L0 精简循环第3刀）：system/ 的活消费者
+# 有五个——init.d/adbd 的 `exec /system/bin/adbd`（树内唯一活引用）、
+# adb shell 的 sh+toybox（219 条目 = 24 常规 + 195 个 applet symlink 农场，
+# adbd 的 PATH 把 /system/bin 放在最前）、radio-bringup 的 /bin/rmt_storage
+# （qmi 三库走 /vendor_a/lib64 分区解析；活体 /proc maps 还映射 libutils——
+# 静态 NEEDED 漏报的运行时依赖）、radio-bringup 的 /vendor/bin/cnss-daemon
+# （WLFW 用户态半边：vendor 的 libperipheral_client.so 反吃 system 的
+# libbinder.so——bake #25 首刷 wlan0 不生、netup 红，热推一库+重启全绿
+# 的活体收据；vendor 件吃 system 库，闭包得跨 /vendor 算，教训）。其余全死：冻结 trampoline 只 exec busybox
+# /sbin/init；fake-sm 顶 servicemanager；aginx-svcd 持狗；busybox+aginx-reboot
+# 持重启；f2fs/erofs 工具无处跑（rootfs 是 ext4，mkfs 在 host）。keep 岛 =
+# 4 bin + ld.config.txt + lib64 白名单 19 件（闭包 17 = 根并集 13 + 传递 4，
+# 另 libutils 走 maps 证据、libbinder 走 cnss-daemon 链）。死件 ~19M。
+# 镜像收据 = bake #25（不与刀B 叠刀）。
+# 刀D toybox 退役（2026-09-12，第4刀）：双 multicall 合一。adb shell 的
+# PATH=/system/bin:/sbin:/bin 里 toybox 只抢到同名优先权，busybox farm
+# 同名全覆盖；toybox-only 25 名（SELinux/logcat 桥那域）在 accept/配方/
+# bringup 全树零引用。连坐三 lib——libz/libprocessgroup 的全树 NEEDED
+# 唯一消费者是 toybox、libcgrouprc 的唯一消费者是 libprocessgroup
+# （adbd/rmt_storage/cnss-daemon 三条闭包均不碰，readelf 全档在案）。
+# toybox 进点名死单后，农场悬链被上方清扫一并回收——system/bin 塌缩到
+# 3 真身。busybox 的 netcat 本名是 nc（/bin/netcat 活体 "applet not
+# found"，从来就是死链），APPLETS 表正名。四件合计 ~0.96M。
+# die 闸：keep 岛任一缺失 = vendor 资产漂移，大声死、绝不静默剪残。
+SYSTEM_KEEP_BIN="adbd linker64 sh"
+SYSTEM_KEEP_LIB="libadbd_auth.so libadbd_fs.so libbase.so libc++.so libc.so"
+SYSTEM_KEEP_LIB="${SYSTEM_KEEP_LIB} libcutils.so libcrypto.so libdl.so"
+SYSTEM_KEEP_LIB="${SYSTEM_KEEP_LIB} liblog.so libm.so libpackagelistparser.so libpcre2.so"
+SYSTEM_KEEP_LIB="${SYSTEM_KEEP_LIB} libselinux.so libutils.so"
+SYSTEM_KEEP_LIB="${SYSTEM_KEEP_LIB} ld-android.so libbinder.so"
+for f in ${SYSTEM_KEEP_BIN}; do
+  test -f "${TREE}/system/bin/${f}" \
+    || { echo "FATAL: system keep bin ${f} missing — vendor asset drift" >&2; exit 1; }
+done
+for f in ${SYSTEM_KEEP_LIB}; do
+  test -f "${TREE}/system/lib64/${f}" \
+    || { echo "FATAL: system keep lib ${f} missing — vendor asset drift" >&2; exit 1; }
+done
+test -f "${TREE}/system/etc/ld.config.txt" \
+  || { echo "FATAL: system/etc/ld.config.txt missing — vendor asset drift" >&2; exit 1; }
+# bin：显式点名死件（考古清单即文档）。刀C 时代白名单法在这里会误杀
+# 195 个 toybox applet symlink——刀D 起 toybox 本身进死单，农场悬链由下方
+# 悬链清扫整体回收（bin 只剩 3 真身，白名单法从此也可用，点名法留着当
+# 考古档案）。resize.f2fs/dump.f2fs/defrag.f2fs/linker_hwasan64/
+# linker_asan64 是指向死目标的 symlink，一并点名；init.android 与 init md5
+# 全同——pack-vendor-boot 在 RAMDISK 世界造的副本随树混入。
+SYSTEM_DEAD_BIN="update_engine_sideload init init.android recovery fastbootd \
+sload_f2fs mkfs.erofs fsck.erofs dump.erofs fsck.f2fs make_f2fs mke2fs \
+e2fsdroid minadbd toolbox charger servicemanager ziptool watchdogd reboot \
+resize.f2fs dump.f2fs defrag.f2fs linker_hwasan64 linker_asan64 toybox"
+for f in ${SYSTEM_DEAD_BIN}; do rm -f "${TREE}/system/bin/${f}"; done
+# 悬链清扫：rm 之后目标已亡的 symlink（ueventd→init 这类没点名的）一并清。
+# 残链本无害（-x 恒假，PATH 落到 busybox），清了是整洁。
+find "${TREE}/system/bin" -type l ! -exec test -e {} \; -delete
+# etc：recovery/fastbootd 的配置与证书；init/、security/（otacerts.zip 在
+# security/ 下）、lib64/hw（四个死 HAL：boot/fastboot/health/bootctrl——
+# 消费者全在死件清单里，aginx-update/aginx-boot-ok 自写 GPT）整目录。
+rm -f "${TREE}/system/etc/ueventd.rc" "${TREE}/system/etc/recovery.fstab" \
+      "${TREE}/system/etc/mke2fs.conf" "${TREE}/system/etc/recovery.wipe" \
+      "${TREE}/system/etc/cgroups.json"
+rm -rf "${TREE}/system/etc/init" "${TREE}/system/etc/security" \
+       "${TREE}/system/lib64/hw"
+# lib64：白名单法（68 条目实测无 symlink，全常规文件+hw 目录，[ -f ] 护
+# 目录）。case 模式判定——`[ x = y ] && keep=1` 当循环末句会踩 set -e。
+for f in "${TREE}"/system/lib64/*; do
+  [ -f "${f}" ] || continue
+  case " ${SYSTEM_KEEP_LIB} " in
+    *" $(basename "${f}") "*) ;;
+    *) rm -f "${f}" ;;
+  esac
+done
+echo "==> system/ prune (刀C 死件+刀D toybox): bin $(ls "${TREE}/system/bin" | wc -l | tr -d ' ') 条目、lib64 $(ls "${TREE}/system/lib64" | wc -l | tr -d ' ') 件、etc 只留 ld.config.txt"
+for f in default.prop prop.default *_contexts; do
+  cp "${RAMDISK}"/${f} "${TREE}/" 2>/dev/null || true
+done
+fi  # BOOT_STYLE=vendor-boot (system/ 段)
+
+# Kernel modules for the touch/display + battery chains (M3/M3c) — machine
+# data (D14): devices/<codename>/modules.txt holds the ordered list. The
+# vendor_boot base loads only the 64-module USB/storage set; the full
+# modules.load panics this kernel (observed 2026-08-27, retry counter
+# burned), so the chains are loaded from the rootfs world by the device's
+# bringup scripts, in the order proven live. Same .ko files as the ramdisk
+# holds — copied from the local unpack (never committed, §7).
+if [ "${BOOT_STYLE}" = "vendor-boot" ]; then
+MODULES="$(grep -Ev '^[[:space:]]*(#|$)' "${DEVDIR}/modules.txt" || true)"
+mkdir -p "${TREE}/lib/modules"
+for m in ${MODULES}; do
+  cp "${RAMDISK}/lib/modules/${m}.ko" "${TREE}/lib/modules/"
+done
+else
+# raw-boot（E5 折债 ③，2026-09-14）：没有 vendor ramdisk 可抄——模块本体
+# 是机型资产 .local/device/${DEVICE}/modules/（live 设备 /lib/modules 逐字
+# 拉回，§7 不进 git）。modules.txt 有条目而 .ko 缺席 = 烤出哑 modem/wifi，
+# 宁死不烤残。
+MODULES="$(grep -Ev '^[[:space:]]*(#|$)' "${DEVDIR}/modules.txt" || true)"
+if [ -n "${MODULES}" ]; then
+  mkdir -p "${TREE}/lib/modules"
+  for m in ${MODULES}; do
+    test -f "${ASSETS}/modules/${m}.ko" \
+      || { echo "FATAL: ${ASSETS}/modules/${m}.ko missing — pull from the live device (devices/${DEVICE}/boot/assets.md)" >&2; exit 1; }
+    cp "${ASSETS}/modules/${m}.ko" "${TREE}/lib/modules/"
+  done
+fi
+fi
+
+# DRM splash painter — the panel stays black without an explicit mode set
+# (the bootloader logo is cont-splash scanout, not KMS; connector sits at
+# enabled=disabled). touch-bringup paints green when touch is up. Built with
+# the same zig toolchain as the trampoline. binder-init mounts binderfs and
+# allocates the binder/hwbinder/vndsbinder devices cnss-daemon needs (this
+# kernel's backport ioctl struct — see the source header).
+ZIG="$(command -v zig || true)"
+test -z "${ZIG}" && ZIG=/opt/homebrew/bin/zig
+test -x "${ZIG}" || { echo "zig not found (needed for splash2/binder-init)" >&2; exit 1; }
+# usr/bin now, not at the recipe step below: the four D13-renamed C tools
+# (aginx-cam-shot/net-scan/net-join/reboot) are zig-built straight into it.
+mkdir -p "${TREE}/bin" "${TREE}/usr/bin"
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/splash" "${RECIPE}/src/splash2.c"
+# cnss/modem 世界四件（binder-init/qrtr-lookup/qmi-req/fake-sm）与 NDK
+# preload 两件同属 vendor-boot 门——raw-boot 机没有它们的消费者。
+if [ "${BOOT_STYLE}" = "vendor-boot" ]; then
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/binder-init" "${RECIPE}/src/binder-init.c"
+# QRTR observability (M3d): qrtr-lookup snapshots/watches the name service,
+# qmi-req sends one raw QMI request. radio-bringup starts a qrtr-lookup
+# watcher before the modem boot trigger to record the fresh-boot service
+# registration order (WLFW 0x45 transient vs never-present).
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/qrtr-lookup" "${RECIPE}/src/qrtr-lookup.c"
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/qmi-req" "${RECIPE}/src/qmi-req.c"
+fi  # BOOT_STYLE=vendor-boot (binder/qrtr 件)
+# cam-shot (M19) — the IFE/RDI stills capture tool. Vendor sensor register
+# tables are decoded into the source; vendor module bins stay local and
+# gitignored. N4: the four brain-facing C tools take their D13 /usr/bin
+# names AT BUILD TIME (aginx-voice spawns /usr/bin/aginx-cam-shot; net-bringup
+# and net-rejoin call /usr/bin/aginx-net-join; net scans go through
+# /usr/bin/aginx-net-scan; reboot is /usr/bin/aginx-reboot). Default flags
+# for a rear shot: --stream --rear --slowrear --rawvendor [--gain N] [--png].
+# M47①: the camera trio (cam-shot.c + campix.h + campix_test.c) lives in
+# devices/<codename>/cam/ (D14 — sensor timing/calibration is machine
+# data); the old-repo copies are frozen history.
+# M47⑤d: encoder = vendored libjpeg-turbo (NEON); the build command (and the
+# source lists it mirrors) lives in build-cam.sh — this script just runs it.
+# E4b 门：cam/ 目录在=相机线才构建（enchilada 节点机无相机，目录不存在）。
+if [ -d "${DEVDIR}/cam" ]; then
+"${ROOT}/scripts/build-cam.sh" "${DEVDIR}/cam"
+install -m 755 "${ROOT}/out/cam/aginx-cam-shot" "${TREE}/usr/bin/aginx-cam-shot"
+# raw2jpg (M19c) — RAW10 dump -> JPEG converter, companion to cam-shot's
+# native --jpeg (for converting already-captured dumps).
+install -m 755 "${ROOT}/out/cam/raw2jpg" "${TREE}/bin/raw2jpg"
+fi  # devices/${DEVICE}/cam 存在
+
+# Bionic LD_PRELOAD helpers (M3d). These load into vendor binaries, so they
+# must be NDK/bionic shared objects, not musl. trace_open.so mirrors file
+# access AND logcat output (__android_log_print & co) onto stderr — it is
+# our only window into cnss-daemon/pd-mapper, which log exclusively through
+# liblog and we run no logd. fake-props.so fakes the servicemanager
+# properties pm-service blocks on and logs every other property read.
+if [ "${BOOT_STYLE}" = "vendor-boot" ]; then
+NDK_CC="${HOME}/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android24-clang"
+test -x "${NDK_CC}" || { echo "NDK clang not found (needed for preload .so)" >&2; exit 1; }
+mkdir -p "${TREE}/lib"
+"${NDK_CC}" -shared -fPIC -O2 -o "${TREE}/lib/trace_open.so" "${RECIPE}/src/trace_open.c"
+"${NDK_CC}" -shared -fPIC -O2 -o "${TREE}/lib/fake-props.so" "${RECIPE}/src/fake-props.c"
+echo "built preload helpers (trace_open.so, fake-props.so)"
+# fake-sm: minimal binder context manager (musl-static) answering every
+# transaction with Status-ok. Without a CM on /dev/binder, vendor libbinder
+# clients (cnss-daemon, pm-service) spin forever in "Waiting 1s on context
+# object" before ever reaching their QMI work.
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/fake-sm" "${RECIPE}/src/fake-sm.c"
+fi  # BOOT_STYLE=vendor-boot (preload + fake-sm)
+# aginx-reboot (原 reboot2): raw reboot(LINUX_REBOOT_CMD_RESTART2) — toybox
+# reboot signals init (we run none) and adb reboot needs adbd's sys.powerctl
+# handling. With no args it plain-reboots; "bootloader" lands in fastboot
+# for re-flashing.
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/usr/bin/aginx-reboot" "${RECIPE}/src/reboot2.c"
+# aginx-panel-off (2026-09-13): headless panel powerdown — smooth-takeover
+# otherwise scans the bootloader splash forever. Black SETCRTC (ownership
+# grab; bare null SETCRTC no-ops because the DRM objects already read
+# disabled under takeover) then null SETCRTC. rcS spawns it backgrounded
+# when /bin/bootcard is absent.
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/usr/bin/aginx-panel-off" "${RECIPE}/src/paneloff.c"
+# wdt (M20c): watchdog probe/arm/starve for /dev/watchdog. The dog itself
+# is armed and petted by aginx-svcd (crates/svc); this is the diagnostics
+# tool that proved the platform story (softdog behind msm_watchdog,
+# hardware bark resources absent) and the live-fire starve reset.
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/wdt" "${RECIPE}/src/wdt.c"
+# rtcal (M23b): pm8xxx RTC alarm arm/read + `sync` — the suspend probes' wake
+# path ("set <epoch>" semantics kept from the /tmp zig one-off). net-bringup
+# runs `rtcal sync` after ntpd to fix the RTC's -53y offset, which also makes
+# early-boot wall time true on the next HCTOSYS pass.
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/rtcal" "${RECIPE}/src/rtcal.c"
+# Ops channel sshd (#142, 2026-09-04) — the maintenance face: ssh in over
+# Wi-Fi or `adb forward tcp:2222 tcp:22` when the subnets differ. Static
+# musl dropbear triplet (first-gen build product, zig cc; the AR must be
+# LLVM's — macOS BSD ar archives break lld member resolution; regeneration
+# in devices/redfin/boot/assets.md). rcS starts the daemon key-only with
+# the host key under /root/.ssh.
+DROPBEAR="${ASSETS}/dropbear/bin"
+for b in dropbear dbclient dropbearkey; do
+  test -x "${DROPBEAR}/${b}" || { echo "missing ${b} — see devices/${DEVICE}/boot/assets.md" >&2; exit 1; }
+  cp "${DROPBEAR}/${b}" "${TREE}/bin/${b}"
+  chmod 755 "${TREE}/bin/${b}"
+done
+# sftp subsystem (#319, L0 缺口刀B) — dropbear 2026.94 编入 SFTP 支持，
+# 每连接 exec DROPBEAR_SFTP_SERVER=/usr/libexec/sftp-server（无参、
+# stdin/stdout 说 SFTP v3）。Go+pkg/sftp 静态件（build 脚本带 out/ 缓存
+# 早退，cacert/resize2fs 同款）；烤进去 = host scp/sftp/GUI 客户端直连。
+# usr/libexec 在下面 320 行 mkdir 才出现，这里自带。
+"${ROOT}/scripts/build-sftp-server.sh" >/dev/null
+mkdir -p "${TREE}/usr/libexec"
+install -m 755 "${ROOT}/out/sftp-server" "${TREE}/usr/libexec/sftp-server"
+# aginx-net-scan (原 nlscan): nl80211 trigger-scan + dump client — busybox
+# has no wireless tools and we ship no libnl. Our WLAN operability check
+# (M3f).
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/usr/bin/aginx-net-scan" "${RECIPE}/src/nlscan.c"
+# aginx-net-join (原 wifi-join, M4): self-contained WPA2-PSK supplicant —
+# CONNECT, EAPOL 4-way handshake over an AF_PACKET socket, NEW_KEY installs;
+# then udhcpc owns IP provisioning. wifi-trace flips QCA vendor dp-trace
+# levels for TX/RX logs (internal, /bin).
+# E5 折债：raw-boot（mainline 6.11 + ath10k）上 split auth/assoc 是唯一
+# 活路（CMD_CONNECT 的 cfg80211 内建 SME 90+ 次空呼吸失败）——该形态下
+# 编译期默认 split，net-bringup 的 4 参调用即 split。vendor-boot 机型
+# （brcmfmac/wcnss 世界）不带此默认，保持显式第 5 参契约。
+NETJOIN_FLAGS=""
+[ "${BOOT_STYLE}" = "vendor-boot" ] || NETJOIN_FLAGS="-DNETJOIN_DEFAULT_SPLIT"
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 ${NETJOIN_FLAGS} \
+  -o "${TREE}/usr/bin/aginx-net-join" "${RECIPE}/src/wifi-join.c"
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/wifi-trace" "${RECIPE}/src/wifi-trace.c"
+# M18 audio I/O: bare-ioctl PCM pair (no alsa-lib) — capture is the
+# agent's "listen" path, playback its "speak" path. Shared uapi header.
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/snd-cap" "${RECIPE}/src/snd-cap.c"
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/snd-play" "${RECIPE}/src/snd-play.c"
+# snd-mixer: ctl get/set (no alsa-lib) — audio-bringup's whole routing
+# recipe runs through it. i2c-reg: rt5514 register peek/poke over
+# /dev/i2c-N (kernel has no debugfs here — see audio-bringup notes).
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/snd-mixer" "${RECIPE}/src/snd-mixer.c"
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/i2c-reg" "${RECIPE}/src/i2c-reg.c"
+# bootcard retired from the image 2026-09-13 (server edition is headless).
+# Returns as the aginx-bootcard opt-in package; rcS spawns /bin/bootcard
+# when present. Source stays at rootfs/src/bootcard.c.
+# Patched vendor ko override (boot-wedge defense, #228): camera-bringup
+# prefers /lib/modules.aginx over vendor. Blob stays out of git (.local) —
+# regenerate with scripts/patch-vsync-ko.sh.
+if [ -d "${ROOT}/.local/modules.aginx" ]; then
+  mkdir -p "${TREE}/lib/modules.aginx"
+  cp "${ROOT}"/.local/modules.aginx/*.ko "${TREE}/lib/modules.aginx/"
+fi
+# httpget: minimal HTTP fetch for the boot internet check — busybox's wget
+# applet segfaults in this build (2026-08-28), so net-bringup uses ours.
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/httpget" "${RECIPE}/src/httpget.c"
+# udhcpc event hook (compiled-in default path) — without it udhcpc wins a
+# lease but nothing applies it to the interface.
+mkdir -p "${TREE}/usr/share/udhcpc"
+cp "${RECIPE}/usr/share/udhcpc/default.script" "${TREE}/usr/share/udhcpc/"
+chmod 755 "${TREE}/usr/share/udhcpc/default.script"
+
+# Radio bring-up payload (M3d). libnl.so is the bionic build cnss-daemon
+# dlopens (LD_LIBRARY_PATH=/lib/...); rmt_storage is the PATCHED stock
+# binary (erase call sites NOPed); cdsp-cdsp-loader.ko is stock
+# cdsp-loader.ko with module/driver/sysfs names renamed (compat + code
+# untouched — it binds soc:qcom,msm-cdsp-loader and boots the CDSP) and
+# modem-npucc-loader.ko is the modem variant re-anchored to the npucc
+# node. See radio/README.md in the asset dir. All are vendor-derived
+# blobs: they live only in gitignored .local/device/redfin/radio/ and are
+# copied in when present. The sealed first-gen repo's
+# scripts/build-radio-blobs.sh regenerates them.
+RADIO="${ASSETS}/radio"
+if [ "${BOOT_STYLE}" != "vendor-boot" ]; then
+  :  # raw-boot 无 cnss/modem 世界——radio payload 整段不适用（E4b）
+elif [ -f "${RADIO}/libnl.so" ] && [ -x "${RADIO}/rmt_storage" ] \
+   && [ -f "${RADIO}/cdsp-cdsp-loader.ko" ] \
+   && [ -f "${RADIO}/modem-npucc-loader.ko" ]; then
+  mkdir -p "${TREE}/lib" "${TREE}/lib/modules"
+  cp "${RADIO}/libnl.so" "${TREE}/lib/libnl.so"
+  cp "${RADIO}/rmt_storage" "${TREE}/bin/rmt_storage"
+  chmod 755 "${TREE}/bin/rmt_storage"
+  cp "${RADIO}/cdsp-cdsp-loader.ko" "${RADIO}/modem-npucc-loader.ko" \
+     "${TREE}/lib/modules/"
+  echo "staged radio payload (libnl.so + patched rmt_storage + cdsp/modem loaders)"
+else
+  echo "NOTE: ${RADIO} incomplete — radio-bringup will fail; see devices/${DEVICE}/boot/assets.md" >&2
+fi
+
+# raw-boot 的 modem/wifi 世界（E5 折债 ④⑦，2026-09-14）——radio payload
+# 段在本机的对价。三腿全硬门，缺任一 = 开机后 modem/wifi 永不生：
+#   固件树   wlanmdsp.mbn（wlan0 出生三件套之一）+ ath10k WCN3990 +
+#            qcom modem 全套，live 设备 /lib/firmware 逐字拉回（§7 不进 git）；
+#   EFS 种子 modem_fs1/fs2/fsc/fsg（出厂 NV 拷贝）——rmtfs 晚到 = modem
+#            拿不到 EFS crash-loop，种子必须随镜像；0600；
+#   qrtr 四件 pd-mapper/tqftpserv/rmtfs 守护 + qmi-ask 操作面，本机源码
+#            编译（rootfs/src/qcom + qmi-ask.c，配方=设备复验过的形态）。
+# 精确匹配 raw-boot（2026-10-07）：armbian-ride 盒无 qcom 世界，继承
+# raw-boot 的其余裁剪但不进此门。
+if [ "${BOOT_STYLE}" = "raw-boot" ]; then
+  test -d "${ASSETS}/firmware/qcom" && test -d "${ASSETS}/firmware/ath10k" \
+    || { echo "FATAL: ${ASSETS}/firmware incomplete (want qcom/ + ath10k/) — pull from the live device (devices/${DEVICE}/boot/assets.md)" >&2; exit 1; }
+  test -e "${ASSETS}/firmware/ath10k/WCN3990/hw1.0/wlanmdsp.mbn" \
+    || { echo "FATAL: wlanmdsp.mbn missing — wlan0 will never be born" >&2; exit 1; }
+  mkdir -p "${TREE}/lib/firmware"
+  cp -R "${ASSETS}/firmware/." "${TREE}/lib/firmware/"
+  test -f "${ASSETS}/rmtfs/modem_fs1" \
+    || { echo "FATAL: ${ASSETS}/rmtfs/modem_fs1 missing — see devices/${DEVICE}/boot/assets.md" >&2; exit 1; }
+  mkdir -p "${TREE}/var/lib/rmtfs"
+  install -m 600 "${ASSETS}"/rmtfs/* "${TREE}/var/lib/rmtfs/"
+  # 编译形态铁律（设备上四件换装复验过，/tmp/qc-build.sh 即此配方）：
+  #   pd-mapper  无 -DANDROID（其 ANDROID 分支是死代码）、不编 lzma_decomp.c
+  #              （stub/lzma.h 是空壳，lzma_stub.c 供符号——.jsn 本不压缩）；
+  #   tqftpserv  无 HAVE_ZSTD（头文件自带 no-zstd 静态回退）；
+  #   rmtfs      带 -DANDROID（sysfs sharedmem 腿：/sys/class/rmtfs）；
+  #   qrtr 三 .c 直接当目标链接——macOS ar 静默丢 ELF 成员，绝不走 .a。
+  QSRC="${RECIPE}/src/qcom"
+  QOUT="${TMPDIR:-/tmp}/aginxos-qcom-build.$$"
+  mkdir -p "${QOUT}"
+  QCOMMON=(-target aarch64-linux-musl -static -O2 -I "${QSRC}/stub" -I "${QSRC}/qrtr/include")
+  for f in logging qmi qrtr; do
+    "${ZIG}" cc "${QCOMMON[@]}" -c "${QSRC}/qrtr/lib/$f.c" -o "${QOUT}/$f.o"
+  done
+  QOBJ=("${QOUT}/logging.o" "${QOUT}/qmi.o" "${QOUT}/qrtr.o")
+  "${ZIG}" cc "${QCOMMON[@]}" "${QSRC}/pd-mapper/pd-mapper.c" "${QSRC}/pd-mapper/assoc.c" \
+    "${QSRC}/pd-mapper/json.c" "${QSRC}/pd-mapper/servreg_loc.c" "${QSRC}/stub/lzma_stub.c" \
+    "${QOBJ[@]}" -o "${TREE}/usr/bin/pd-mapper"
+  "${ZIG}" cc "${QCOMMON[@]}" "${QSRC}/tqftpserv/tqftpserv.c" "${QSRC}/tqftpserv/translate.c" \
+    "${QOBJ[@]}" -o "${TREE}/usr/bin/tqftpserv"
+  "${ZIG}" cc "${QCOMMON[@]}" -DANDROID "${QSRC}/rmtfs/qmi_rmtfs.c" "${QSRC}/rmtfs/qmi_tlv.c" \
+    "${QSRC}/rmtfs/rmtfs.c" "${QSRC}/rmtfs/storage.c" "${QSRC}/rmtfs/sharedmem.c" \
+    "${QSRC}/rmtfs/rproc.c" "${QSRC}/rmtfs/util.c" "${QOBJ[@]}" -o "${TREE}/usr/bin/rmtfs"
+  "${ZIG}" cc "${QCOMMON[@]}" "${RECIPE}/src/qmi-ask.c" "${QOBJ[@]}" -o "${TREE}/usr/bin/qmi-ask"
+  # 81voltd: IMS Data QMI server (svc 770). Protocol files are GPL-2.0-or-later
+  # from upstream 81voltd; 81voltd.c is the libqrtr port (no glib/MM).
+  "${ZIG}" cc "${QCOMMON[@]}" -I "${QSRC}/81voltd" \
+    "${QSRC}/81voltd/81voltd.c" "${QSRC}/81voltd/qmi_imsd.c" \
+    "${QOBJ[@]}" -o "${TREE}/usr/bin/81voltd"
+  rm -rf "${QOUT}"
+  echo "staged raw-boot modem/wifi world (firmware + EFS seed + qrtr daemons + qmi-ask + 81voltd)"
+fi
+
+# Recipe: etc (init.d/aginx/svc.d units/aginx conf/crontabs + manifest+sig),
+# usr/bin (bridge sh faces + .aginxmd sidecars), libexec/aginx
+# (net-watch/net-rejoin). All D13 knowledge lives here.
+mkdir -p "${TREE}/bin" "${TREE}/sbin" "${TREE}/usr/libexec/aginx" "${TREE}/var/bin"
+if [ "${HAS_UPDATE}" = "1" ]; then mkdir -p "${TREE}/aginxos"; fi
+cp "${RECIPE}/busybox" "${TREE}/bin/busybox"
+cp -R "${RECIPE}/etc/." "${TREE}/etc/"
+# shadow is baked root-locked (* = inert until `passwd`); git carries no
+# file mode beyond the exec bit, so pin 0600 here — never world-readable
+chmod 600 "${TREE}/etc/shadow"
+# raw-boot 无 adbd（无 /system、无 ffs gadget）——摘掉它的 respawn 行，
+# 否则 busybox init 对一个不存在的脚本空转刷屏（E4b）。
+if [ "${BOOT_STYLE}" != "vendor-boot" ]; then
+  sed -i '' '/init\.d\/adbd/d' "${TREE}/etc/inittab"
+fi
+
+# /home 出厂整树（结构刀④）：真源=仓里 home/（docs/FS.md）——SOUL/
+# MEMORY、photos/files 空树占位、workflows/clone-creator 出厂助理。
+# 内嵌种子机制已退役（结构刀②③），镜像不带这棵树=裸 L0 首启无母体
+# 人格、无助理。「OTA 不覆盖 /home」只管升级通道——烤线是全新盘灌注，
+# 不受此限。
+cp -R "${ROOT}/home/." "${TREE}/home/"
+# 机型数据注入（D14）：bringup 脚本与 device.toml 都来自 devices/<codename>/。
+# bringup 内容 verbatim 搬运（211 行 mixer recipe 那种收据流不重排）；
+# device.toml 落 /etc/aginx/（hwd::load_or_exit 的读点——烤错档案=开机
+# fail-fast，正脸拒绝）。
+mkdir -p "${TREE}/etc/aginx"
+install -m 644 "${DEVDIR}/device.toml" "${TREE}/etc/aginx/device.toml"
+# armbian-ride（#66 W1）：切入脚本落树根 /init——目录骑乘后它就是卖家
+# 盘的 /aginxos/init，armbianEnv.txt 的 init= 指它。
+if [ "${BOOT_STYLE}" = "armbian-ride" ]; then
+  install -m 755 "${DEVDIR}/boot/ride-init" "${TREE}/init"
+  # wifi 固件腿（#453）：BCM43430 brcmfmac 件——模块走上面的通用
+  # modules.txt 路（.local/…/modules/），固件树在此门（缺件宁死不烤，
+  # 同 raw-boot 纪律；内核 request_firmware 在 init ns 根下解析，
+  # 骑乘世界 PID1 chroot 后即本树的 /lib/firmware）。
+  test -e "${ASSETS}/firmware/brcm/brcmfmac43430-sdio.bin" \
+    || { echo "FATAL: ${ASSETS}/firmware/brcm/brcmfmac43430-sdio.bin missing — harvest from the seller p2 (devices/${DEVICE}/boot/assets.md)" >&2; exit 1; }
+  mkdir -p "${TREE}/lib/firmware"
+  cp -R "${ASSETS}/firmware/." "${TREE}/lib/firmware/"
+fi
+# panel.on（D14：有屏机器的结果页上屏开关）：aginxbrowser 的面板线程
+# 只认 `--panel` 或这枚标记（main.rs 启动门），而全仓无人造它——L0 线
+# 「点卡黑屏」根因即此（09-26 晨报复验卡事故）。有 [panel] 段的机器
+# 落标记；无屏机器（schema 强制段在，占位 width=0 即无面板信号）不落，
+# 引擎不起面板线程（省 DRM 轮询日志）。
+if grep -qE '^\[panel\]' "${DEVDIR}/device.toml" \
+   && ! grep -qE '^width *= *0$' "${DEVDIR}/device.toml"; then
+  : > "${TREE}/etc/aginx/panel.on"
+fi
+for b in "${DEVDIR}"/bringup/*; do
+  test -f "${b}" || { echo "missing bringup scripts in ${DEVDIR}/bringup/" >&2; exit 1; }
+  install -m 755 "${b}" "${TREE}/etc/init.d/$(basename "${b}")"
+done
+# 首启 root-fs 扩容件（#318，L0 缺口刀1）：rcS 同步跑 disk-grow（上面的
+# bringup 件），它要 resize2fs。落 /usr/bin——镜像 usr 下只有 bin/libexec/
+# share 一个工具目录的惯例位（usr/sbin 不存在，别开新目录）。
+# build-resize2fs.sh 自己有缓存早退（out/ 已建即秒回，cacert 同款模式），
+# 首次才下载+约 2 分钟构建。
+"${ROOT}/scripts/build-resize2fs.sh" >/dev/null
+install -m 755 "${ROOT}/out/resize2fs" "${TREE}/usr/bin/resize2fs"
+# ---- L0 清单组装（刀4；只改 TREE 副本，配方不动）--------------------------
+# 镜像 svc.d 必须恰好 2 单元（net-watch + aginxbrowser——后者是缺席容忍
+# 单元：裸上游二进制无配方可装，30s 自拾取先例，不能删）。母体/UI/网关/
+# 密钥/语音的单元全在包里带 [service]——svc.d 多出来=有人把引擎单元烤回
+# 镜像，die。
+L0_SVC_COUNT="$(ls "${TREE}/etc/aginx/svc.d/" | wc -l | tr -d ' ')"
+[ "${L0_SVC_COUNT}" = "2" ] \
+  || { echo "FATAL: L0 svc.d has ${L0_SVC_COUNT} units (want 2: net-watch + aginxbrowser) — engine units ride packages, not the image" >&2; exit 1; }
+# 基础 manifest（全 opt 目录）+ opt 附加两层（#422 服务器叙事分层）：
+#   A 服务器/agent 节点 —— 默认宣传与文档举例用这一层
+#   B 冻结人脸（term/ocr/qr/pair）—— 仍进清单可装，零新投、不进默认故事
+# sha 取 out/pkgs 产物；url/version/deps 取 pkgs/<name>/pkg.toml。
+# 配方 bump 了 version 没重跑 build-pkg → sha 文件名对不上 → die。
+# 组装进树后签名（.sig 是构建产物，不回写配方）。
+OPT_ADD="${TMPDIR:-/tmp}/agpkg-opt-add.$$"
+: > "${OPT_ADD}"
+# Layer A — server / agent node
+OPT_LAYER_A="aginx aginx-gateway aginx-secretd aginx-asr aginx-tts aginx-voice aginx-update aginx-gateway-local aginx-channels aginxresearch morning-report"
+# Layer B — frozen human-face (available; not default narrative)
+OPT_LAYER_B="aginx-term aginx-ocr aginx-qr aginx-pair"
+for p in ${OPT_LAYER_A} ${OPT_LAYER_B}; do
+  R="pkgs/${p}"
+  p_ver="$(sed -n 's/^version *= *"\([^"]*\)"/\1/p' "${R}/pkg.toml" | sed -n '1p')"
+  p_url="$(sed -n 's/^url *= *"\([^"]*\)"/\1/p' "${R}/pkg.toml" | sed -n '1p')"
+  p_dep="$(sed -n 's/^depends *= *"\([^"]*\)"/\1/p' "${R}/pkg.toml" | sed -n '1p')"
+  sha_file="${ROOT}/out/pkgs/${p}-v${p_ver}-4pc.tar.sha256"
+  [ -n "${p_ver}" ] && [ -n "${p_url}" ] \
+    || { echo "FATAL: ${R}/pkg.toml 缺 version/url" >&2; exit 1; }
+  [ -s "${sha_file}" ] \
+    || { echo "FATAL: L0 manifest needs ${sha_file} — run ./scripts/build-pkg.sh ${p} first" >&2; exit 1; }
+  p_sha="$(sed -n '1p' "${sha_file}")"
+  case "${p_sha}" in
+    ''|*[!0-9a-f]*) echo "FATAL: bad sha in ${sha_file}: '${p_sha}'" >&2; exit 1 ;;
+  esac
+  [ "${#p_sha}" -eq 64 ] \
+    || { echo "FATAL: sha not 64 hex chars in ${sha_file}" >&2; exit 1; }
+  printf '%s %s %s opt %s%s\n' "${p}" "${p_url}" "${p_sha}" "${p_ver}" "${p_dep:+ ${p_dep}}" >> "${OPT_ADD}"
+done
+cat "${RECIPE}/etc/agpkg.manifest" "${OPT_ADD}" > "${TREE}/etc/agpkg.manifest"
+cp "${OPT_ADD}" "${ROOT}/out/pkgs/agpkg.opt.add"
+rm -f "${OPT_ADD}"
+[ -f "${ROOT}/.local/keys/aginx.key" ] \
+  || { echo "FATAL: L0 manifest signing needs .local/keys/aginx.key" >&2; exit 1; }
+(cd "${ROOT}" && cargo run -q -p aginx-sign -- sign .local/keys/aginx.key "${TREE}/etc/agpkg.manifest")
+(cd "${ROOT}" && cargo run -q -p aginx-sign -- verify .local/keys/aginx.pub "${TREE}/etc/agpkg.manifest") \
+  || { echo "FATAL: L0 manifest sig does not verify" >&2; exit 1; }
+echo "==> L0 manifest: 基础清单（全 opt）+ 分层 opt 附加已签名进树（A 服务器 / B 冻结人脸）"
+cp -R "${RECIPE}/usr/bin/." "${TREE}/usr/bin/"
+cp -R "${RECIPE}/libexec/aginx/." "${TREE}/usr/libexec/aginx/"
+# 批② C1（09-10）：包管件的 sidecar 一律由安装器从 pkg.toml 生成（安装
+# 即覆写）。L0 下 asr/tts/ocr/voice/term 不再烤镜像，usr/bin 里剩下的
+# .aginxmd 全属本线直装件（download/done/secret；刀F 起 qr/pair/update
+# 也走包）——无安装器接管，sidecar 由配方自带，`aginx commands` 摘要走
+# 这里。
+# version stamp (M14): what the running image is, for aginx-update
+# status/compare. N4: stamped from THIS repo's git; D14: the device rides
+# the stamp — 版本串自证出自哪台机的烤机线。行尾 ` l0`（刀4 起的无头
+# 底座形戳，n6 预检读它）。
+STAMP="$(git -C "${ROOT}" log -1 --format="aginxos ${DEVICE} %h %cd" --date=short 2>/dev/null || echo "aginxos ${DEVICE} unknown") l0"
+echo "${STAMP}" > "${TREE}/etc/aginx-version"
+
+# L0（刀4；结构刀① 起两件）：router/server 不烤——母体=`aginx` 树包
+# （bin/{aginx,aginx-server}，exec=bin/aginx → face
+# /var/bin/aginx，[service] 单元随包走——pkgs/aginx/pkg.toml）。
+# Platform CLIs (new-repo builds; N4③b 改姓四件)。
+# 刀F（2026-09-12）：qr/pair/update 出镜像走包——L0 是 Linux，不预生成
+# 二维码；qr/pair 由 voice/term 的 depends 自动带装（face /var/bin），
+# update 由母体包 depends 锚（裸箱升级=重刷，装 aginx 后才有 apply 面）。
+# term 不烤也不拉（#427：rcS 的 aginx-term-handoff 已删——#422 黑匣子
+# 裁决后镜像不生成任何人脸，term 包纯目录死件）。批③ (09-10): wizard
+# 出烤——装机流程是扫码/语音，wizard 无入口。
+install -m 755 "${TARGET}/aginx-pkg" "${TREE}/usr/bin/"
+install -m 755 "${TARGET}/aginx-svc" "${TREE}/usr/bin/"
+# boot-ok 是 redfin ABL 的 GPT slot-retry 写手；raw-boot 不烤（未探针的
+# GPT 一个字节不写——rcS 同名门互保）。
+if [ "${BOOT_STYLE}" = "vendor-boot" ]; then
+  install -m 755 "${TARGET}/aginx-boot-ok" "${TREE}/usr/bin/"
+fi
+install -m 755 "${TARGET}/aginx-svcd" "${TREE}/usr/libexec/aginx/"
+# N5① 吸收件：updater/download 改由本仓重编（修了三死路径的活版本），
+# 落位与老资产同名同位。刀F：update 出镜像走包；download 留——pkg 的
+# TLS 取件腿（裸 bar 的 codex 拉取走它），update 包的 DOWNLOAD_BIN 零改。
+install -m 755 "${TARGET}/aginx-download" "${TREE}/usr/bin/"
+# N5② 吸收件：done/secret 全由本仓重编。刀F：qr 出镜像走包；L0 只装
+# /usr/bin 的人面 aginx-secret——secretd 引擎走 aginx-secretd 包
+# （[service] 单元随包）。
+install -m 755 "${TARGET}/aginx-done" "${TARGET}/aginx-secret" "${TREE}/usr/bin/"
+# N5⑨ QR fixture（n5-qr.jpg）出镜像（刀4：n5 套件随 L0 退役，设备面
+# 不再读；配方文件保留——host 侧 qr 测试仍以它为真源）。
+# N5⑥ 网关不烤（刀4）：aginx-gateway 包（[service] 随包，depends=
+# aginx-secretd）；id/secret 与 env 灌注是装机后置事，见 pkgs/*/SKILL.md。
+# 模型树三口（刀4 L0）：asr/tts/ocr 全走包（bionic 件+模型一树，M42e
+# 收据：tts 真权重是 fp32 model.onnx，tarball 里的 int8 是 133B lfs 指针
+# ——build-pkg.sh 已折），镜像只种三条 dangling symlink 指向 pkgfiles
+# 未来真身；装包前 test -e 恒假（哑终端无害），provision 的
+# ensure_model_link 每靴幂等对账（D15 边界律：大件可重下物既不烤也不进
+# state tar）。
+mkdir -p "${TREE}/var/models/tts"
+ln -s /var/lib/aginx/pkgfiles/aginx-asr/models/asr "${TREE}/var/models/asr"
+ln -s /var/lib/aginx/pkgfiles/aginx-tts/models/tts/vits-melo-tts-zh_en \
+  "${TREE}/var/models/tts/vits-melo-tts-zh_en"
+ln -s /var/lib/aginx/pkgfiles/aginx-ocr/models/ocr "${TREE}/var/models/ocr"
+# CJK 字体（M38a 冻结资产）不烤镜像（刀4）：随 aginx-term 包走——
+# build-pkg.sh 从配方原文件打包，term cjk.rs font_path() 兜底探测
+# pkgfiles 路径（老全量镜像的烤入路径优先级在其前，兼容在役机）。
+# Trampoline (M2/M22) — frozen first-gen pair (assets.md); aginxos-init
+# performs the userdata rootfs swap the update flow relies on.
+if [ "${HAS_UPDATE}" = "1" ]; then
+  cp "${TRAMP}/aginxos-init" "${TRAMP}/aginxos-agent" "${TREE}/aginxos/"
+fi
+
+# Exec bits: git may not carry them through cp for every recipe file, and a
+# non-executable init script or shim is invisible at boot. Sidecars (.aginxmd)
+# stay 644 — they are data read next to the binary.
+chmod 755 "${TREE}"/etc/init.d/*
+chmod 755 "${TREE}"/usr/bin/aginx-file "${TREE}"/usr/bin/aginx-mem \
+  "${TREE}"/usr/bin/aginx-sys-status "${TREE}"/usr/bin/aginx-backup
+chmod 755 "${TREE}"/usr/libexec/aginx/net-watch "${TREE}"/usr/libexec/aginx/net-rejoin \
+  "${TREE}"/usr/libexec/aginx/net-timesync
+# NB: wifi.conf.example rides along in ${RECIPE}/etc — the real
+# /etc/wifi.conf (with the passphrase) rides the aginx-update state tar
+# from the running device (N4 从零开始 keeps only /home/photos; the join
+# credential is re-provisioned through voice/QR), never committed.
+
+# Curated applet symlinks — enough for init and debugging; rcS runs
+# `busybox --install -s /bin` to fill in the full set on first boot.
+APPLETS="[ awk blkid cat chmod chown clear cp cut date dd df dmesg echo env \
+expr false fdisk find free getty grep gunzip gzip head hostname id insmod ip \
+kill less ln ls lsmod mkdir mknod more mount mv nc netstat nice passwd \
+pidof ping printf ps renice rm rmdir route sed setsid sh sleep sort \
+start-stop-daemon stat su switch_root sync tail tar telnet test top touch tr \
+true umount uname uniq uptime vi wc wget which whoami xargs zcat"
+for a in ${APPLETS}; do ln -sf busybox "${TREE}/bin/${a}"; done
+ln -sf ../bin/busybox "${TREE}/sbin/init"
+ln -sf ../bin/busybox "${TREE}/sbin/reboot"
+ln -sf ../bin/busybox "${TREE}/sbin/poweroff"
+ln -sf ../bin/busybox "${TREE}/sbin/ifconfig"
+
+# TLS trust store: codex (and anything using system-native cert roots)
+# fails with "waiting for network" without it. Cached under out/ so the
+# download happens once per host, not once per build — falls back to the
+# staged bundle in .local/assets before hitting the network.
+CACERT="${ROOT}/out/cacert.pem"
+if [ ! -s "${CACERT}" ] && [ -s "${ROOT}/.local/assets/cacert.pem" ]; then
+  cp "${ROOT}/.local/assets/cacert.pem" "${CACERT}"
+fi
+if [ ! -s "${CACERT}" ]; then
+  curl -sL --max-time 120 -o "${CACERT}" https://curl.se/ca/cacert.pem
+fi
+mkdir -p "${TREE}/etc/ssl/certs"
+cp "${CACERT}" "${TREE}/etc/ssl/certs/ca-certificates.crt"
+ln -sf certs/ca-certificates.crt "${TREE}/etc/ssl/cert.pem"
+
+# Registry gate (N4): lint the assembled command set with a host-built
+# router before the image is packed. AGINX_CMD_PATH mirrors the device
+# (/var/bin first) plus /bin+/sbin so future aginx:exec targets into the
+# internals resolve. Bridge shims (aginx-file/mem) declare no
+# aginx:exec — their targets exist only after provision syncs the
+# packages (legal absence, warning-only). Fails the build on collisions,
+# missing summaries, bad metadata, or missing exec targets.
+cargo build -p aginx-router --release >/dev/null
+AGINX_CMD_PATH="${TREE}/var/bin:${TREE}/usr/bin:${TREE}/bin:${TREE}/sbin" \
+AGINX_GROUPS_DESC="${TREE}/etc/aginx/groups.desc" \
+  "${ROOT}/target/release/aginx" commands --check \
+  || { echo "aginx commands --check failed — fix the faces" >&2; exit 1; }
+
+mkdir -p "${ROOT}/out"
+
+# 刀A strip 门（2026-09-12，L0 精简循环第1刀）：bringup C 件 zig cc 链
+# 不带 -s——bin/ 30M 里 27M 是 debug_info+symtab（实测 dropbear
+# 2.8M→0.55M，-80%）。烤前对全树 ELF 可执行档（e_type EXEC/DYN）过
+# 一道 --strip-all。ET_REL 跳过——lib/modules 的 .ko 靠 modinfo 等
+# 段活着，strip-all 会毁。（刀E 勘误 2026-09-12：strip-debug 在这批
+# vendor .ko 上实测 0 字节收益——23 件+modules.aginx 无一 debug 段；
+# msm_drm.ko 653 段的大头是 .rela.* LTO 重定位 1.6M、.text 1.2M、
+# .symtab+.strtab 0.47M（模块加载按名解析，承重）。刀A 的「另立刀」
+# 承诺就此退役，刀E 收的是 Rust 半边 opt-level=z，见 zigbuild 注释。）
+# Rust 件/AOSP 件已 stripped，过一遍是无害 no-op。工具：llvm-strip
+# （本机是版本化 Cellar 安装、无裸名软链，command -v 摸不到——glob
+# 兜底）；Linux 上 binutils strip 同参等价。
+STRIP_BIN="$(command -v llvm-strip || true)"
+[ -z "${STRIP_BIN}" ] \
+  && STRIP_BIN="$(ls /opt/homebrew/Cellar/llvm@*/[0-9]*/bin/llvm-strip 2>/dev/null | head -n1 || true)"
+[ -z "${STRIP_BIN}" ] && STRIP_BIN="$(command -v strip || true)"
+[ -n "${STRIP_BIN}" ] || { echo "FATAL: no ELF strip tool (llvm-strip / binutils strip)" >&2; exit 1; }
+stripped=0
+while IFS= read -r -d '' f; do
+  # ELF magic + e_type@16：02 00=EXEC、03 00=DYN（01 00=REL=.ko 跳过）
+  [ "$(head -c 4 "${f}" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ] || continue
+  case "$(od -An -tx1 -j16 -N2 "${f}" | tr -d ' \n')" in
+    0200|0300) ;;
+    *) continue ;;
+  esac
+  "${STRIP_BIN}" --strip-all "${f}" && stripped=$((stripped + 1))
+# lib/firmware 整树剪除（E5 折债补丁，2026-09-14）：.mbn 是 PIL 固件/
+# modem 配置的 ELF 皮——llvm-strip 对它们全部动刀（实测首烤：mcfg_sw
+# 几百档 md5 变脸、wlanmdsp/mba/ipa_fws 报段越界），外设引导只认原始
+# 字节，一个都不能 strip。.ko 是 ET_REL 本就跳过；EFS 种子不是 ELF。
+done < <(find "${TREE}" -path "${TREE}/lib/firmware" -prune -o -type f -print0)
+echo "strip gate: ${stripped} ELF binaries stripped"
+# rm first: mke2fs never truncates an existing output file, so a SIZE
+# change leaves stale bytes past the new fs end (a 2g image stayed 2 GiB
+# after re-baking at 1g — the tail was the old image, 2026-09-02).
+rm -f "${IMG}"
+# 刀B mkfs 几何（2026-09-12，L0 精简循环第2刀）：bake #23 直读超块，
+# used 152.6M 里内容只占 ~51M——journal 16384 块=64M + inode 表
+# 131072×256B=32M 两项就是 used 的 2/3。两刀主食：
+#   -N 8192   树 239 文件，8192 inode=34 倍余量；disk-grow 在 rcS 里先于
+#             provision 跑，resize2fs 按块比同比例长 inode（bake #23 活体：
+#             131072→7,151,616 = 28602363/524288 整——54.56×），装包全落
+#             扩容后 ~447k inode，永不受初始数卡。
+#   -J size=8 journal 64M→8M。原子性不变：journal 尺寸只界定批处理/检查点
+#             频率，不界定断电滚回语义。resize2fs 1.47.0 扩容不重长 journal
+#             （resize 源码只有 fix_sb_journal_backup 搬家记账），109G fs
+#             顶 8M journal 功能无损（机上无 e2fsck，无尺寸校验面）。
+# 不加 -m 0：预留块是水位线不占 used（root 恒可用），零镜像收益。
+"${MKE2FS}" -t ext4 -b 4096 -N 8192 -J size=8 -F -d "${TREE}" "${IMG}" "${SIZE}"
+echo "built ${IMG} ($(du -h "${IMG}" | cut -f1)) from ${TREE}"

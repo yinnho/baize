@@ -1,0 +1,24 @@
+[package]
+name = "aginx-voice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# M42a→N4②b：语音对话守护（D13 改姓 aginx-voice）。
+# protocol.rs 是纯逻辑（词表/序数/拼读/回读/状态机），host 全覆盖测试；
+# 音频件（snd-cap/snd-play 子进程 + brain asr/tts HTTP）全在 audio.rs。
+# 屏显面走 /run/aginx-voice/face（原子 JSON，aginx-term 轮询渲染——脸不归 voiced 画）。
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+libc = "0.2"
+wificonf = { path = "../wificonf" } # #64 回退表：persist_wifi 换值不覆写
+# M42b: WIFI: 码载荷解析。default-features=false——只拿纯字符串解析，
+# 不把 quircs/aginx-img 拉进 aginx-voice（解码在独立 aginx-qr 进程里做）。
+aginx-qr = { path = "../qr", default-features = false }
+# D14: 机型事实（PTT 节点/键码、audio、panel、quirks、affinity）唯一来源。
+hwd = { path = "../hwd" }
+
+[dev-dependencies]

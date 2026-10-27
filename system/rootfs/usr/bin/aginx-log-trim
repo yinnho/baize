@@ -1,0 +1,20 @@
+#!/bin/sh
+# aginx:summary=log size gate — copytruncate tail-keep for svc/day logs (busybox has no logrotate)
+# aginx:examples=(cron 04:23 daily, after aginx-backup)
+# aginx:group=ops
+# v1 (#553, 2026-10-27): over 20M trim to last 5M, in-place (cat > same
+# inode — append writers keep their fd; NEVER mv-swap an active log).
+# Pure size gate: files under the limit are untouched, exits 0 always.
+LIMIT=$((20 * 1024 * 1024))
+KEEP=$((5 * 1024 * 1024))
+for f in /var/log/aginx-svc/*.log /var/log/day-review.log; do
+  [ -f "$f" ] || continue
+  s=$(wc -c < "$f" 2>/dev/null) || continue
+  [ "$s" -le "$LIMIT" ] && continue
+  t="${f}.trim-$$"
+  if tail -c "$KEEP" "$f" > "$t" 2>/dev/null && [ -s "$t" ]; then
+    cat "$t" > "$f"
+  fi
+  rm -f "$t"
+done
+exit 0

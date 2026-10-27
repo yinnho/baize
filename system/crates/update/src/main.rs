@@ -1,0 +1,962 @@
+//! aginx-update — A/B self-updater (M14; N5① 吸收并修三条死路径).
+//!
+//! Flow: pull manifest → download images → verify sha256 → write the
+//! INACTIVE slot's partitions → `aginx-boot-ok set-active` (GPT attrs) →
+//! reboot. Fully autonomous: on this ABL (r3-0.6) the GPT attributes
+//! alone select the OS slot — proven on device 2026-09-02 with
+//! attrs-only switches in both directions, no bootloader involvement.
+//!
+//! `capture` (standalone verb): arm the state marker from the RUNNING
+//! system. state-restore is a one-shot handshake, so a fastboot flash
+//! day (the devices/<codename>/boot/ flash script) must capture before
+//! leaving adb — bake #20 receipt 2026-09-09, see the verb below.
+//!
+//! Rollback (all observed on device 2026-09-02): the staged slot boots
+//! with succ=0/tries=7; ABL drains one try per boot that rcS does not
+//! mark successful; at tries=0 ABL marks the slot unbootable,
+//! re-activates the still-successful other slot, and cold-reboots into
+//! it by itself. Failure classes that do NOT auto-rollback and need
+//! host rescue: a zeroed/garbled boot header (ABL drops to fastboot),
+//! and a kernel that hangs early (device sits dark — no watchdog yet;
+//! a forced power-cycle drains one more try). sha256 verification at
+//! apply time is what keeps those classes from ever being written.
+//!
+//! The GPT surgery deliberately lives in aginx-svc's aginx-boot-ok —
+//! one audited implementation of the 4K-block multi-LUN attribute
+//! rewrite. This crate only orchestrates and streams bytes.
+//!
+//! Ordering rule (why this is crash-safe mid-update): partition bytes are
+//! written and fsynced FIRST; the GPT attr flip is the last write before
+//! reboot. A crash at any earlier point leaves both slots exactly as they
+//! were. A crash after the flip but before reboot is harmless — the next
+//! boot just takes the new slot early.
+//!
+//! Manifest (JSON, local path or https URL; image urls likewise):
+//!   { "version": "…",
+//!     "device":        "<codename>", // MANDATORY (D14): the machine
+//!                                  // this update was baked for — must
+//!                                  // equal [device]name in this
+//!                                  // machine's device.toml or apply refuses
+//!     "boot":          { "url": "…", "sha256": "hex", "size": N },
+//!     "vendor_boot":   { … },   // optional, only when modules move
+//!     "dtbo":          { … },   // optional
+//!     "vbmeta":        { … },   // optional — must chain with the images
+//!     "vbmeta_system": { … } }  // optional
+//!
+//! M21: every manifest must have a detached ed25519 signature — base64
+//! in `<manifest>.sig` next to it (local sibling file, or URL + ".sig")
+//! — verified against the public key compiled in below BEFORE the
+//! manifest is parsed or a single image byte is fetched. Sign with the
+//! host tool: `aginx-sign sign .local/keys/aginx.key manifest.json`.
+//! The private key never leaves the developer machine.
+//!
+//! HTTPS goes through aginx-download (M10) — the phone's only TLS
+//! fetcher.
+//!
+//! N5① note: the frozen first-gen binary spawned `/usr/bin/agdl`,
+//! `/usr/bin/agboot-ok` and `/bin/reboot2` — all renamed by the D13
+//! sweep, so on the N4 image apply died at the set-active step. The
+//! three spawn paths are now consts below, pinned by test.
+
+use std::fs::{File, OpenOptions};
+use std::io::Read;
+use std::os::unix::io::AsRawFd;
+use std::process::Command;
+
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Image {
+    url: String,
+    sha256: String,
+    size: Option<u64>,
+    /// M22: body already streamed to the swap area on userdata (by the
+    /// host over adb — a sparse 1-2 GiB mke2fs image cannot ride the
+    /// small live fs). aginx-update then hashes the staged blocks
+    /// against this manifest's sha256 and writes the commit header.
+    /// Production https updates (pre_staged absent) download through
+    /// aginx-download as usual — which will need direct-to-offset
+    /// streaming once images approach the fs size (download seek;
+    /// follow-up).
+    #[serde(default)]
+    pre_staged: bool,
+}
+
+#[derive(Deserialize)]
+struct Manifest {
+    version: String,
+    /// D14 cross-machine gate: the codename this update was baked for.
+    /// NO serde default — a pre-D14 manifest fails to parse, fail-closed
+    /// like every other protocol break (old updaters ignore the unknown
+    /// field, so old-device → new-manifest still applies; the refuse is
+    /// new-device → old-manifest, exactly where cross-machine flashing
+    /// would start). Must equal [device]name in /etc/aginx/device.toml,
+    /// checked in cmd_apply before a single byte is staged.
+    device: String,
+    boot: Image,
+    vendor_boot: Option<Image>,
+    dtbo: Option<Image>,
+    vbmeta: Option<Image>,
+    vbmeta_system: Option<Image>,
+    /// M22: new rootfs image for the userdata partition. Carried through
+    /// the signed manifest like everything else; the swap itself happens
+    /// in the initramfs trampoline on next boot (see SWAP_OFF below).
+    rootfs: Option<Image>,
+}
+
+// --- N5① D13 device paths (spawn targets; pinned by test) ---
+const DOWNLOAD_BIN: &str = "/usr/bin/aginx-download";
+const BOOT_OK_BIN: &str = "/usr/bin/aginx-boot-ok";
+const REBOOT_BIN: &str = "/usr/bin/aginx-reboot";
+
+// --- M22 rootfs-swap protocol (MUST match crates/aginxos-init) ---
+//
+// The live rootfs IS the userdata partition, so it cannot be rewritten
+// from userspace. Instead aginx-update stages the new image ON the same
+// partition, beyond the ext4 (fs is 2 GiB; if it is ever grown past
+// ~7 GiB these offsets must move):
+//   8 GiB         SWAP_OFF:  4096-byte header (the commit point)
+//   8 GiB + 4096  SWAP_BODY: new rootfs image, payload_len bytes
+//   32 GiB        BAK_OFF:   trampoline's copy of the old fs
+// Header layout: magic[8]="AGXROOT1", u32le version=1, u32le flags
+// (1=pending), u64le payload_len, sha256 as 64 lowercase hex chars,
+// u64le old_len (bytes of the current fs, for the trampoline's
+// backup). Write order is crash-safe: body first + fsync, header LAST
+// — a crash before the header leaves the old rootfs untouched and the
+// stray body harmless. The trampoline (new vendor_boot, A/B-protected
+// by M14) sees the marker, verifies the body hash, backs up the old
+// fs to 32 GiB, dd's the new image to offset 0, clears the marker,
+// and only then mounts. That is why a rootfs update MUST ship with
+// the matching vendor_boot: an old trampoline ignores the marker.
+const SWAP_OFF: u64 = 8 << 30;
+const SWAP_HDR: u64 = 4096;
+const BAK_OFF: u64 = 32 << 30;
+const SWAP_MAGIC: &[u8; 8] = b"AGXROOT1";
+// Irreplaceable device state (Wi-Fi psk, relay identity in /home/.aginx,
+// logs) staged at 64 GiB with its own ASCII marker — MUST match
+// /etc/init.d/state-restore. M26 added /var/lib: aginx-pkg
+// skills/units/stamps and the aginx-done markers live there and are NOT
+// re-downloadable (a rootfs swap without them would silently wipe every
+// package's skill + provision memory). Re-downloadable things (/var/bin
+// binaries) deliberately still do NOT ride along: the new rootfs
+// re-provisions them.
+const STATE_OFF: u64 = 64 << 30;
+const STATE_MAGIC: &[u8; 8] = b"AGXSTATE";
+const STATE_MAX: u64 = 512 << 20;
+
+/// state tar 的 --exclude 集：state-restore 是整包 `tar -xf -C /`（overlay
+/// 语义——老成员盖掉新镜像同名件，镜像新增件幸存）。/etc/aginx 里 image-owned
+/// 的五件绝不能进 tar：2026-09-05 实测 N4 state tar 把 N5 烤的
+/// secret.policy/groups.desc 盖回老版，网关因此拿不到 relay.primary（secretd
+/// 每 5s 拒读）直到手工重推。第五件 device.toml（D14）：机型档案归烤机线
+/// 所有——老 tar 把它盖回旧机型/旧 schema，轻则本 gate 读到错的
+/// [device]name，schema 加必填字段时直接开机 fail-fast，与 09-05 同类。
+/// busybox tar 的 --exclude 匹配存储名（无前导斜杠）、flag 须在成员表前
+/// ——设备实测 2026-09-05。
+///
+/// D15 边界律增补（2026-09-09 蛋案）：asr/tts/ocr 三包的模型树住
+/// /var/lib/aginx/pkgfiles/<pkg>/ 下，~450MB 会撞 STATE_MAX 顶——大件可
+/// 重下物不进 state tar（与 /var/bin 同律：换像后 resync 判 missing 自动
+/// 补拉）。/var/models 的 symlink 让位 ensure 归 provision（每靴）。
+const STATE_TAR_EXCLUDES: &str = "--exclude=etc/aginx/svc.d --exclude=etc/aginx/secret.policy --exclude=etc/aginx/gateway.toml --exclude=etc/aginx/groups.desc --exclude=etc/aginx/device.toml --exclude=var/lib/aginx/pkgfiles/aginx-asr --exclude=var/lib/aginx/pkgfiles/aginx-tts --exclude=var/lib/aginx/pkgfiles/aginx-ocr";
+
+/// state tar 的成员白名单（testable 单一真源）。/etc/agpkg.manifest(+.sig)
+/// 随行（#472①）：重刷否则把设备的包钉回烤机版——B 线 mirror repair 腿
+/// 正是从这份 manifest 补装。
+const STATE_TAR_MEMBERS: &str =
+    "/etc/wifi.conf /etc/agpkg.manifest /etc/agpkg.manifest.sig /etc/aginx /home /root /var/log /var/power /var/lib";
+
+fn swap_header(payload_len: u64, sha256_hex: &str, old_len: u64) -> Vec<u8> {
+    let mut h = vec![0u8; SWAP_HDR as usize];
+    h[..8].copy_from_slice(SWAP_MAGIC);
+    h[8..12].copy_from_slice(&1u32.to_le_bytes()); // version
+    h[12..16].copy_from_slice(&1u32.to_le_bytes()); // flags: pending
+    h[16..24].copy_from_slice(&payload_len.to_le_bytes());
+    h[24..88].copy_from_slice(sha256_hex.as_bytes());
+    h[88..96].copy_from_slice(&old_len.to_le_bytes());
+    h
+}
+
+/// Stream a file to `off` on an already-open block device, fsync, return
+/// bytes written.
+fn pwrite_file_at(fd: i32, staged: &str, off: u64) -> u64 {
+    let mut src = File::open(staged).unwrap_or_else(|e| die(&format!("open {staged}: {e}")));
+    let len = src.metadata().unwrap_or_else(|e| die(&format!("stat {staged}: {e}"))).len();
+    let mut buf = vec![0u8; 4 << 20];
+    let mut off = off;
+    let mut left = len;
+    while left > 0 {
+        let n = src.read(&mut buf).unwrap_or_else(|e| die(&format!("read {staged}: {e}")));
+        if n == 0 { die(&format!("{staged}: short read at {}", len - left)); }
+        let mut done = 0usize;
+        while done < n {
+            let w = unsafe {
+                libc::pwrite(fd, buf[done..n].as_ptr() as *const _, (n - done) as _, off as libc::off_t)
+            };
+            if w <= 0 { die(&format!("pwrite at {off}: {}", std::io::Error::last_os_error())); }
+            done += w as usize;
+            off += w as u64;
+        }
+        left -= n as u64;
+    }
+    len
+}
+
+/// The state marker header: magic(8) + 16 zero-padded decimal digits of
+/// length + newline, zero-padded to SWAP_HDR — parsed by
+/// /etc/init.d/state-restore with nothing but dd/head/cut (`tr -d '\000'`
+/// then `cut -c9-24` takes exactly the 16 digits; the newline at byte 24
+/// falls outside the cut and leading zeros keep the shell's octal-parse
+/// guard quiet).
+fn state_header(len: u64) -> Vec<u8> {
+    let mut h = vec![0u8; SWAP_HDR as usize];
+    h[..8].copy_from_slice(STATE_MAGIC);
+    h[8..24].copy_from_slice(format!("{len:016}").as_bytes());
+    h[24] = b'\n';
+    h
+}
+
+/// Capture the irreplaceable set as a tar (busybox, absolute paths) and
+/// stage it at STATE_OFF with an ASCII header: magic(8) + 16 decimal
+/// digits of length + newline — parseable by /etc/init.d/state-restore
+/// with nothing but dd/head/cut. Marker last = crash-safe.
+///
+/// The tar builds on the REAL fs (/var/tmp), never on the manifest's
+/// staging dir: that sits on tmpfs, and on 2026-09-03 tar died mid-file
+/// there (tmpfs/memory pressure, killed at 235491328 bytes into
+/// /root/bin/codex) — a partial tar the swap boot then extracted,
+/// leaving a truncated codex. tar's exit status is now fatal: a killed
+/// or ENOSPC'd capture must refuse the update, not ship half a state.
+///
+/// 凭据法条（#467 续）：state tar **按设计**带凭据（换根保活——wifi
+/// 三件、brain env、relay/config、引擎 auth 都必须活着渡过重刷），因此
+/// 它只许以两种形态存在：userdata 64GiB 偏移的 AGXSTATE 裸块（一次性
+/// marker 消费），或 /var/tmp 下 umask 077 的短暂 staging 件。绝不当
+/// 备份拷出机（§9 同律：能自举凭据的包=冒充者启动包）；aginx-backup
+/// 的路径面（/home、/var/lib/aginx、/etc/aginx）也不含 /var/tmp。
+fn stage_state_tar() {
+    let _ = std::fs::create_dir_all("/var/tmp");
+    let tar_path = "/var/tmp/aginx-update-state.tar";
+    let _ = std::fs::remove_file(tar_path);
+    // best-effort: an agent mid-write means one file is torn, not lost.
+    // umask 077: the staging tar carries credentials — 0644 would expose
+    // them to every reader for the capture window. Member whitelist =
+    // STATE_TAR_MEMBERS (manifest+sig ride along, #472①).
+    let st = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "umask 077; tar -cf {tar_path} {STATE_TAR_EXCLUDES} {STATE_TAR_MEMBERS} 2>/dev/null"
+        ))
+        .status()
+        .unwrap_or_else(|e| die(&format!("spawn tar: {e}")));
+    if !st.success() {
+        die(&format!(
+            "state capture tar exited {:?} — refusing to update (would ship a torn state)",
+            st.code()
+        ));
+    }
+    let len = match std::fs::metadata(&tar_path) {
+        Ok(m) => m.len(),
+        Err(_) => die("state capture produced no tar — refusing to update (would be a factory reset)"),
+    };
+    if len == 0 || len > STATE_MAX {
+        die(&format!("state tar is {len} bytes (max {STATE_MAX}) — refusing"));
+    }
+    let dev = "/dev/block/by-name/userdata";
+    let dst = OpenOptions::new().write(true).open(dev)
+        .unwrap_or_else(|e| die(&format!("open {dev} rw: {e}")));
+    let fd = dst.as_raw_fd();
+    let wrote = pwrite_file_at(fd, &tar_path, STATE_OFF + SWAP_HDR);
+    if wrote != len {
+        die(&format!("state tar wrote {wrote} != {len}"));
+    }
+    unsafe { libc::fsync(fd) };
+    let h = state_header(len);
+    let mut done = 0usize;
+    while done < h.len() {
+        let w = unsafe {
+            libc::pwrite(fd, h[done..].as_ptr() as *const _, (h.len() - done) as _, STATE_OFF as libc::off_t)
+        };
+        if w <= 0 { die(&format!("pwrite state header: {}", std::io::Error::last_os_error())); }
+        done += w as usize;
+    }
+    unsafe { libc::fsync(fd) };
+    println!("aginx-update: state tar staged at {STATE_OFF} ({len} bytes)");
+    let _ = std::fs::remove_file(&tar_path);
+}
+
+/// Verify the pre-staged body ON the block device (hash over
+/// SWAP_OFF+SWAP_HDR .. len) against the signed manifest, then write the
+/// commit header. The signature is the trust anchor: the host streamed
+/// the bytes, the manifest says what they must hash to.
+fn commit_rootfs_swap(img: &Image) {
+    let dev = "/dev/block/by-name/userdata";
+    // read+write: the pre-staged body is verified by pread ON the blkdev —
+    // a write-only fd fails that pread with EBADF (observed 2026-09-02).
+    let dst = OpenOptions::new().read(true).write(true).open(dev)
+        .unwrap_or_else(|e| die(&format!("open {dev} rw: {e}")));
+    let fd = dst.as_raw_fd();
+    let len = match std::fs::metadata(&img.url) {
+        // a local image tells us its length directly
+        Ok(m) => m.len(),
+        Err(_) => img.size.unwrap_or_else(|| die("pre-staged rootfs needs a local url or size")),
+    };
+    if len == 0 || len % 4096 != 0 {
+        die(&format!("pre-staged rootfs len {len} — want non-zero 4K-aligned"));
+    }
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 4 << 20];
+    let mut done: u64 = 0;
+    while done < len {
+        let want = ((len - done) as usize).min(buf.len());
+        let n = unsafe {
+            libc::pread(fd, buf[..want].as_mut_ptr() as *mut _, want as _, (SWAP_OFF + SWAP_HDR + done) as libc::off_t)
+        };
+        if n <= 0 {
+            die(&format!("read staged body at {done}: {}", std::io::Error::last_os_error()));
+        }
+        h.update(&buf[..n as usize]);
+        done += n as u64;
+    }
+    let got = hex(&h.finish());
+    if !got.eq_ignore_ascii_case(&img.sha256) {
+        die(&format!("pre-staged rootfs body sha256 {got} != manifest {} — re-stream it", img.sha256));
+    }
+    println!("aginx-update: pre-staged rootfs body verified ({len} bytes)");
+
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    let cst = std::ffi::CString::new("/").unwrap();
+    if unsafe { libc::statfs(cst.as_ptr(), &mut st) } != 0 {
+        die(&format!("statfs /: {}", std::io::Error::last_os_error()));
+    }
+    let old_len = st.f_blocks as u64 * st.f_bsize as u64;
+    if old_len + (4 << 20) >= SWAP_OFF {
+        die(&format!("rootfs fs is {old_len} bytes — grown into the {SWAP_OFF} swap area, refusing"));
+    }
+    let hdr = swap_header(len, &got, old_len);
+    let mut w = 0usize;
+    while w < hdr.len() {
+        let k = unsafe {
+            libc::pwrite(fd, hdr[w..].as_ptr() as *const _, (hdr.len() - w) as _, SWAP_OFF as libc::off_t)
+        };
+        if k <= 0 { die(&format!("pwrite swap header: {}", std::io::Error::last_os_error())); }
+        w += k as usize;
+    }
+    unsafe { libc::fsync(fd) };
+    println!("aginx-update: rootfs swap committed at {SWAP_OFF} (len {len}, old fs {old_len})");
+}
+
+/// Stage the verified rootfs image into the swap area on the userdata
+/// partition. Nothing at offset 0 is touched — the running fs stays
+/// valid no matter when we crash.
+fn stage_rootfs_swap(staged: &str, sha256_hex: &str) -> u64 {
+    let dev = "/dev/block/by-name/userdata";
+    let dst = OpenOptions::new().write(true).open(dev)
+        .unwrap_or_else(|e| die(&format!("open {dev} rw: {e}")));
+    let src = File::open(staged).unwrap_or_else(|e| die(&format!("open {staged}: {e}")));
+    let len = src.metadata().unwrap_or_else(|e| die(&format!("stat {staged}: {e}"))).len();
+    if len == 0 || len % 4096 != 0 {
+        die(&format!("{staged}: len {len} — want a non-zero 4K-aligned image"));
+    }
+    // old fs extent (for the trampoline's backup): the mounted rootfs
+    // knows its own size.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    let cst = std::ffi::CString::new("/").unwrap();
+    if unsafe { libc::statfs(cst.as_ptr(), &mut st) } != 0 {
+        die(&format!("statfs /: {}", std::io::Error::last_os_error()));
+    }
+    let old_len = st.f_blocks as u64 * st.f_bsize as u64;
+    if old_len + (4 << 20) >= SWAP_OFF {
+        die(&format!("rootfs fs is {old_len} bytes — grown into the {SWAP_OFF} swap area, refusing"));
+    }
+
+    let fd = dst.as_raw_fd();
+    let wrote = pwrite_file_at(fd, staged, SWAP_OFF + SWAP_HDR);
+    if wrote != len {
+        die(&format!("rootfs image wrote {wrote} != {len}"));
+    }
+    unsafe { libc::fsync(fd) };
+    // commit point: the header, last
+    let h = swap_header(len, sha256_hex, old_len);
+    let mut done = 0usize;
+    while done < h.len() {
+        let w = unsafe {
+            libc::pwrite(fd, h[done..].as_ptr() as *const _, (h.len() - done) as _, SWAP_OFF as libc::off_t)
+        };
+        if w <= 0 { die(&format!("pwrite swap header: {}", std::io::Error::last_os_error())); }
+        done += w as usize;
+    }
+    unsafe { libc::fsync(fd) };
+    println!("aginx-update: rootfs staged at {SWAP_OFF} on userdata (len {len}, old fs {old_len}, backup target {BAK_OFF})");
+    len
+}
+
+fn die(msg: &str) -> ! {
+    eprintln!("aginx-update: {msg}");
+    std::process::exit(1);
+}
+
+/// Active slot from the kernel cmdline — `_a`/`_b`. Never guessed: an
+/// updater that flashes the wrong slot is a brick.
+fn active_slot() -> String {
+    std::fs::read_to_string("/proc/cmdline")
+        .ok()
+        .and_then(|c| {
+            c.split_whitespace().find_map(|t| {
+                let v = t.strip_prefix("androidboot.slot_suffix=")?;
+                let v = v.trim_matches('"');
+                (v == "_a" || v == "_b").then(|| v.to_string())
+            })
+        })
+        .unwrap_or_else(|| die("no androidboot.slot_suffix on cmdline — refusing to flash"))
+}
+
+fn other(slot: &str) -> String {
+    if slot == "_a" { "_b".into() } else { "_a".into() }
+}
+
+/// Download `url` to `out` if remote (via aginx-download), or point at
+/// it if local.
+fn stage(url: &str, out: &str) -> String {
+    if url.starts_with('/') {
+        if !std::path::Path::new(url).is_file() {
+            die(&format!("local source {url} missing"));
+        }
+        return url.to_string();
+    }
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        die(&format!("unsupported url {url}"));
+    }
+    let st = Command::new(DOWNLOAD_BIN)
+        .arg(url)
+        .arg(out)
+        .status()
+        .unwrap_or_else(|e| die(&format!("cannot run aginx-download: {e}")));
+    if !st.success() {
+        die(&format!("aginx-download failed on {url}"));
+    }
+    out.to_string()
+}
+
+fn sha256_hex_file(path: &str) -> String {
+    let mut f = File::open(path).unwrap_or_else(|e| die(&format!("open {path}: {e}")));
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 4 << 20];
+    loop {
+        let n = f.read(&mut buf).unwrap_or_else(|e| die(&format!("read {path}: {e}")));
+        if n == 0 { break; }
+        h.update(&buf[..n]);
+    }
+    hex(&h.finish())
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Partition byte size via BLKGETSIZE64 — the image must fit, full stop.
+fn part_size(dev: &str) -> u64 {
+    let f = File::open(dev).unwrap_or_else(|e| die(&format!("open {dev}: {e}")));
+    let mut sz: libc::c_ulonglong = 0;
+    unsafe {
+        // ioctl's request arg is c_int on linux but c_ulong on darwin —
+        // `as _` keeps this host-testable; the bits are the same ioctl.
+        if libc::ioctl(f.as_raw_fd(), 0x80081272u32 as _, &mut sz) != 0 {
+            die(&format!("BLKGETSIZE64 on {dev}: {}", std::io::Error::last_os_error()));
+        }
+    }
+    sz
+}
+
+/// Stream `img` onto raw partition `dev`, fsync at the end. Nothing is
+/// read back — the sha256 was checked on the staging file.
+fn write_part(img: &str, dev: &str) -> u64 {
+    let ps = part_size(dev);
+    let mut src = File::open(img).unwrap_or_else(|e| die(&format!("open {img}: {e}")));
+    let meta = src.metadata().unwrap_or_else(|e| die(&format!("stat {img}: {e}")));
+    if meta.len() > ps {
+        die(&format!("{img} is {} bytes, {dev} only {ps}", meta.len()));
+    }
+    let dst = OpenOptions::new().write(true).open(dev)
+        .unwrap_or_else(|e| die(&format!("open {dev} rw: {e} — is the slot mounted?")));
+    let mut buf = vec![0u8; 4 << 20];
+    let mut off: u64 = 0;
+    loop {
+        let n = src.read(&mut buf).unwrap_or_else(|e| die(&format!("read {img}: {e}")));
+        if n == 0 { break; }
+        let mut done = 0usize;
+        while done < n {
+            let w = unsafe {
+                libc::pwrite(dst.as_raw_fd(), buf[done..n].as_ptr() as *const _, (n - done) as _, off as libc::off_t)
+            };
+            if w <= 0 {
+                die(&format!("pwrite {dev} at {off}: {}", std::io::Error::last_os_error()));
+            }
+            done += w as usize;
+            off += w as u64;
+        }
+    }
+    unsafe { libc::fsync(dst.as_raw_fd()) };
+    off
+}
+
+fn space_at(dir: &str) -> u64 {
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    let c = match std::ffi::CString::new(dir) { Ok(c) => c, Err(_) => return 0 };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return 0;
+    }
+    (st.f_bavail as i64).max(0) as u64 * st.f_bsize as u64
+}
+
+/// First usable staging dir — userdata (`/` on this rootfs) keeps large
+/// downloads off tmpfs.
+fn staging_root() -> String {
+    for d in ["/data/update", "/update", "/tmp/aginx-update"] {
+        let _ = std::fs::create_dir_all(d);
+        if space_at(d) > 0 {
+            return d.to_string();
+        }
+    }
+    die("no usable staging directory")
+}
+
+/// M21 signature gate: the detached sig must verify over the RAW
+/// manifest bytes (no canonicalization — the file is signed exactly as
+/// fetched) against the compiled-in key. Called before parse, so an
+/// unsigned or tampered manifest dies without a single download.
+/// M26: the key + verify live in the agsign lib — one key, one chain,
+/// shared with agpkg's package manifest gate. N5①: that lib is now
+/// aginx-sign in this repo; same key pair, verified byte-identical.
+fn verify_manifest_sig(body: &str, sig_b64: &str) {
+    aginx_sign::verify(body.as_bytes(), sig_b64)
+        .unwrap_or_else(|e| die(&format!("manifest signature INVALID — refusing this update ({e})")));
+}
+
+fn fetch_manifest(src: &str) -> Manifest {
+    let (body, sig) = if src.starts_with('/') {
+        let body = std::fs::read_to_string(src).unwrap_or_else(|e| die(&format!("read {src}: {e}")));
+        let sig = std::fs::read_to_string(format!("{src}.sig"))
+            .unwrap_or_else(|e| die(&format!("read {src}.sig: {e} — unsigned manifests are rejected (M21)")));
+        (body, sig)
+    } else {
+        let staged = stage(src, &format!("{}/manifest.json", staging_root()));
+        let body = std::fs::read_to_string(&staged).unwrap_or_else(|e| die(&format!("read {staged}: {e}")));
+        let sig_staged = stage(&format!("{src}.sig"), &format!("{}/manifest.json.sig", staging_root()));
+        let sig = std::fs::read_to_string(&sig_staged).unwrap_or_else(|e| die(&format!("read {sig_staged}: {e}")));
+        (body, sig)
+    };
+    verify_manifest_sig(&body, &sig);
+    serde_json::from_str(&body).unwrap_or_else(|e| die(&format!("manifest parse: {e}")))
+}
+
+fn verify(img: &Image, path: &str) {
+    let meta = std::fs::metadata(path).unwrap_or_else(|e| die(&format!("stat {path}: {e}")));
+    if let Some(sz) = img.size {
+        if meta.len() != sz {
+            die(&format!("{path}: size {} != manifest {}", meta.len(), sz));
+        }
+    }
+    let got = sha256_hex_file(path);
+    if !got.eq_ignore_ascii_case(&img.sha256) {
+        die(&format!("{path}: sha256 {got} != manifest {}", img.sha256));
+    }
+}
+
+fn current_version() -> String {
+    std::fs::read_to_string("/etc/aginx-version").map(|s| s.trim().to_string()).unwrap_or_else(|_| "unknown".into())
+}
+
+/// D14 cross-machine gate, pure for tests: a manifest baked for another
+/// machine must be refused before anything is staged. The codenames are
+/// compared exactly (they double as devices/<codename>/ dir names).
+fn device_matches(m: &Manifest, me: &str) -> Result<(), String> {
+    if m.device == me {
+        Ok(())
+    } else {
+        Err(format!(
+            "manifest is for device '{}' but this machine is '{}' — refusing (cross-machine update)",
+            m.device, me
+        ))
+    }
+}
+
+fn cmd_apply(src: &str, no_reboot: bool) {
+    let m = fetch_manifest(src);
+    // D14 gate before any slot work: who am I comes from the same
+    // single reader every crate uses, never a guess.
+    let me = &hwd::load_or_exit().device.name;
+    device_matches(&m, &me).unwrap_or_else(|e| die(&e));
+    let act = active_slot();
+    let tgt = other(&act);
+    println!("aginx-update: running {} → applying {} to slot {tgt}", current_version(), m.version);
+
+    let root = staging_root();
+    let parts: Vec<(&str, &Image)> = vec![("boot", &m.boot)].into_iter()
+        .chain(m.vendor_boot.iter().map(|i| ("vendor_boot", i)))
+        .chain(m.dtbo.iter().map(|i| ("dtbo", i)))
+        .chain(m.vbmeta.iter().map(|i| ("vbmeta", i)))
+        .chain(m.vbmeta_system.iter().map(|i| ("vbmeta_system", i)))
+        .collect();
+    for (name, img) in &parts {
+        let staged = format!("{root}/{name}.img");
+        let staged = stage(&img.url, &staged);
+        verify(img, &staged);
+        let dev = format!("/dev/block/by-name/{name}{tgt}");
+        let n = write_part(&staged, &dev);
+        println!("aginx-update: {name}: {n} bytes → {dev} (sha256 ok)");
+        if staged != img.url {
+            let _ = std::fs::remove_file(&staged);
+        }
+    }
+    // M22: stage the new rootfs into the userdata swap area (after all
+    // partition writes — the marker must never reference an update whose
+    // kernel half failed to land). Rootfs updates require the matching
+    // vendor_boot: only that trampoline knows how to perform the swap.
+    // State tar goes first: whenever the swap marker exists, the captured
+    // state must already be complete.
+    if let Some(img) = &m.rootfs {
+        if m.vendor_boot.is_none() {
+            die("manifest has rootfs but no vendor_boot — the swap trampoline must ship with it");
+        }
+        stage_state_tar();
+        if img.pre_staged {
+            commit_rootfs_swap(img);
+        } else {
+            let staged = format!("{root}/rootfs.img");
+            let staged = stage(&img.url, &staged);
+            verify(img, &staged);
+            stage_rootfs_swap(&staged, &img.sha256);
+            if staged != img.url {
+                let _ = std::fs::remove_file(&staged);
+            }
+        }
+    }
+    let st = Command::new(BOOT_OK_BIN)
+        .arg("set-active").arg(tgt.trim_start_matches('_'))
+        .status()
+        .unwrap_or_else(|e| die(&format!("run aginx-boot-ok: {e}")));
+    if !st.success() {
+        die("aginx-boot-ok set-active failed — slots untouched, safe to retry");
+    }
+    println!("aginx-update: slot {tgt} staged — rebooting into update (auto-rollback after 7 unmarked boots)");
+    if no_reboot {
+        println!("aginx-update: --no-reboot given, not rebooting");
+        return;
+    }
+    Command::new(REBOOT_BIN).arg("reboot").status()
+        .unwrap_or_else(|e| die(&format!("aginx-reboot: {e}")));
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("status") => {
+            println!("slot {} version {}", active_slot(), current_version());
+            let _ = Command::new(BOOT_OK_BIN).arg("status").status();
+        }
+        Some("capture") => {
+            // Standalone arm of the state marker, from the RUNNING system.
+            // bake #20 receipt (2026-09-09): state-restore is a ONE-SHOT
+            // handshake — the marker staged by the last apply is consumed
+            // by that image's own first boot (header cleared, body left).
+            // `fastboot flash userdata` rewrites the front 2 GiB only and
+            // re-arms nothing, so a fastboot flash day MUST run this
+            // first, while the old system is still up: after the manual
+            // Power+VolDown fastboot entry it is too late for this
+            // boot. Same stage_state_tar() the apply flow calls — one
+            // implementation, one wire format.
+            stage_state_tar();
+        }
+        Some("apply") => {
+            let src = args.get(1).unwrap_or_else(|| die("usage: aginx-update apply <manifest> [--no-reboot]"));
+            cmd_apply(src, args.iter().any(|a| a == "--no-reboot"));
+        }
+        Some("sha256") => {
+            // self-check against busybox sha256sum; also used to build manifests
+            let f = args.get(1).unwrap_or_else(|| die("usage: aginx-update sha256 <file>"));
+            println!("{}", sha256_hex_file(f));
+        }
+        Some("write-part") => {
+            // escape hatch / test primitive: verified write, no slot logic
+            let img = args.get(1).unwrap_or_else(|| die("usage: aginx-update write-part <img> <part>"));
+            let part = args.get(2).unwrap_or_else(|| die("usage: aginx-update write-part <img> <part>"));
+            let n = write_part(img, part);
+            println!("aginx-update: {n} bytes → {part}");
+        }
+        _ => {
+            eprintln!("usage: aginx-update <status|apply|capture|write-part|sha256> …");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// SHA-256 (FIPS 180-4), streaming. In-crate on purpose: the updater must
+/// not grow a dependency tree of its own.
+struct Sha256 {
+    h: [u32; 8],
+    len: u64,
+    buf: [u8; 64],
+    n: usize,
+}
+
+const K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+impl Sha256 {
+    fn new() -> Sha256 {
+        Sha256 { h: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19], len: 0, buf: [0; 64], n: 0 }
+    }
+
+    fn block(&mut self, b: &[u8]) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let mut v = self.h;
+        for i in 0..64 {
+            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+            let ch = (v[4] & v[5]) ^ ((!v[4]) & v[6]);
+            let t1 = v[7].wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+            let t2 = s0.wrapping_add(maj);
+            v[7] = v[6]; v[6] = v[5]; v[5] = v[4];
+            v[4] = v[3].wrapping_add(t1);
+            v[3] = v[2]; v[2] = v[1]; v[1] = v[0];
+            v[0] = t1.wrapping_add(t2);
+        }
+        for i in 0..8 {
+            self.h[i] = self.h[i].wrapping_add(v[i]);
+        }
+    }
+
+    fn update(&mut self, mut d: &[u8]) {
+        self.len = self.len.wrapping_add(d.len() as u64);
+        while !d.is_empty() {
+            let take = (64 - self.n).min(d.len());
+            self.buf[self.n..self.n + take].copy_from_slice(&d[..take]);
+            self.n += take;
+            d = &d[take..];
+            if self.n == 64 {
+                let b = self.buf;
+                self.block(&b);
+                self.n = 0;
+            }
+        }
+    }
+
+    fn finish(mut self) -> [u8; 32] {
+        let bits = self.len.wrapping_mul(8);
+        self.update(&[0x80]);
+        while self.n != 56 {
+            self.update(&[0]);
+        }
+        // update() would count the length bytes into len — irrelevant now
+        let mut b = self.buf;
+        b[56..64].copy_from_slice(&bits.to_be_bytes());
+        self.block(&b);
+        let mut out = [0u8; 32];
+        for (i, h) in self.h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&h.to_be_bytes());
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sha(data: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(data);
+        hex(&h.finish())
+    }
+
+    #[test]
+    fn sha256_fips_vectors() {
+        assert_eq!(
+            sha(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn sha256_streaming_chunks_match_one_shot() {
+        // update()'s 64-byte buffer boundary logic: odd chunk sizes must
+        // hash identically to a single pass.
+        let long: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let one = sha(&long);
+        let mut h = Sha256::new();
+        for c in long.chunks(7) {
+            h.update(c);
+        }
+        assert_eq!(hex(&h.finish()), one);
+    }
+
+    #[test]
+    fn swap_header_byte_layout() {
+        let hex64 = "ab".repeat(32);
+        let h = swap_header(0x1122334455667788, &hex64, 2040373248);
+        assert_eq!(h.len(), 4096);
+        assert_eq!(&h[..8], b"AGXROOT1");
+        assert_eq!(&h[8..12], &1u32.to_le_bytes()); // version
+        assert_eq!(&h[12..16], &1u32.to_le_bytes()); // flags: pending
+        assert_eq!(&h[16..24], &0x1122334455667788u64.to_le_bytes());
+        assert_eq!(&h[24..88], hex64.as_bytes());
+        assert_eq!(&h[88..96], &2040373248u64.to_le_bytes());
+        assert!(h[96..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn swap_protocol_offsets_stable() {
+        // M22 wire protocol — MUST match crates/aginxos-init (frozen) and
+        // /etc/init.d/state-restore. Changing any of these bricks the
+        // update path against every image already in the field.
+        assert_eq!(SWAP_OFF, 8u64 << 30);
+        assert_eq!(SWAP_HDR, 4096);
+        assert_eq!(BAK_OFF, 32u64 << 30);
+        assert_eq!(STATE_OFF, 64u64 << 30);
+        assert_eq!(STATE_MAX, 512u64 << 20);
+        assert_eq!(SWAP_MAGIC, b"AGXROOT1");
+        assert_eq!(STATE_MAGIC, b"AGXSTATE");
+    }
+
+    #[test]
+    fn state_tar_excludes_image_owned_etc_aginx_members() {
+        // 2026-09-05 收据：state-restore 整包 tar -xf，N4 state tar 把 N5 烤的
+        // policy/groups.desc 盖回老版（网关拿不到 relay.primary 直到重推）。
+        // 五件 image-owned：单元表/策略/网关形状/命令组表/机型档案（D14——
+        // device.toml 归烤机线，老 tar 盖回=读错机型）。
+        for image_owned in ["svc.d", "secret.policy", "gateway.toml", "groups.desc", "device.toml"] {
+            assert!(
+                STATE_TAR_EXCLUDES
+                    .contains(&format!("--exclude=etc/aginx/{image_owned}")),
+                "missing --exclude for {image_owned}"
+            );
+        }
+    }
+
+    #[test]
+    fn state_tar_excludes_model_tree_pkgfiles() {
+        // 2026-09-09 蛋案：asr/tts/ocr 模型树住 pkgfiles，~450MB 会撞
+        // STATE_MAX 顶——大件可重下物不进 state tar（与 /var/bin 同律：
+        // 换像后 resync 判 missing 自动补拉）。/var/models 的 symlink
+        // 让位 ensure 归 provision 每靴。
+        for model_tree in ["aginx-asr", "aginx-tts", "aginx-ocr"] {
+            assert!(
+                STATE_TAR_EXCLUDES
+                    .contains(&format!("--exclude=var/lib/aginx/pkgfiles/{model_tree}")),
+                "missing --exclude for {model_tree} model tree"
+            );
+        }
+        // 排除只钉三树：整目录排除会让含 files/ 的第三方包换像丢真身
+        // （exec symlink face 指进 pkgfiles 树里，state-restore 本应带回）
+        assert_eq!(
+            STATE_TAR_EXCLUDES.matches("pkgfiles").count(),
+            3,
+            "pkgfiles excludes must stay exactly the three model trees"
+        );
+    }
+
+    #[test]
+    fn state_tar_carries_manifest_and_sig_for_repair() {
+        // #472①: a capture re-flash keeps the ledger (stamps) but wipes
+        // /var/bin; the baked manifest would pin stale package versions —
+        // the device's own manifest + detached sig must survive the swap
+        // so aginx-pkg repair --net re-fetches exactly what was installed.
+        assert!(STATE_TAR_MEMBERS.contains("/etc/agpkg.manifest"));
+        assert!(STATE_TAR_MEMBERS.contains("/etc/agpkg.manifest.sig"));
+        // the pre-#472 member set is otherwise unchanged
+        for member in ["/etc/wifi.conf", "/etc/aginx", "/home", "/root", "/var/log", "/var/power", "/var/lib"] {
+            assert!(STATE_TAR_MEMBERS.contains(member), "missing {member}");
+        }
+        // /var/bin stays out by design — the whole point of the repair leg
+        assert!(!STATE_TAR_MEMBERS.contains("/var/bin"));
+    }
+
+    #[test]
+    fn state_header_layout_matches_state_restore_parser() {
+        // bake #20 receipt: the header is parsed by /etc/init.d/state-restore
+        // as `tr -d '\000'` then `cut -c9-24` — bytes 8..24 must be exactly
+        // 16 zero-padded decimal digits (leading zeros keep the shell's
+        // octal guard quiet), and the newline at byte 24 must stay OUTSIDE
+        // the cut so it can never leak into the length field.
+        let h = state_header(55865344);
+        assert_eq!(h.len(), 4096);
+        assert_eq!(&h[..8], b"AGXSTATE");
+        assert_eq!(&h[8..24], b"0000000055865344");
+        assert_eq!(h[24], b'\n');
+        assert!(h[25..].iter().all(|&b| b == 0));
+        // round-trip through the parser's own arithmetic
+        let hdr: String = h.iter().map(|&b| b as char).filter(|&c| c != '\0').collect();
+        let len: u64 = hdr[8..24].trim().parse().expect("16 decimal digits parse");
+        assert_eq!(len, 55865344);
+    }
+
+    #[test]
+    fn manifest_without_device_field_fails_parse() {
+        // D14 fail-closed: a pre-D14 manifest must not parse — the field
+        // has no serde default on purpose.
+        let old = r#"{ "version": "1", "boot": { "url": "/x", "sha256": "00" } }"#;
+        let err = serde_json::from_str::<Manifest>(old).err().expect("must fail parse").to_string();
+        assert!(err.contains("device"), "parse error must name the field: {err}");
+    }
+
+    #[test]
+    fn manifest_with_device_field_parses() {
+        let m: Manifest = serde_json::from_str(
+            r#"{ "version": "1", "device": "deva",
+                 "boot": { "url": "/x", "sha256": "00" } }"#,
+        )
+        .expect("device + version + boot is the minimal shape");
+        assert_eq!(m.device, "deva");
+    }
+
+    #[test]
+    fn device_matches_is_exact_codename() {
+        // The cross-machine refuse: exact match, no prefix/substring
+        // leniency (codenames double as devices/ dir names).
+        let m = Manifest {
+            version: "1".into(),
+            device: "deva".into(),
+            boot: Image { url: "/x".into(), sha256: "00".into(), size: None, pre_staged: false },
+            vendor_boot: None, dtbo: None, vbmeta: None, vbmeta_system: None, rootfs: None,
+        };
+        assert!(device_matches(&m, "deva").is_ok());
+        let err = device_matches(&m, "devb").err().expect("must refuse").to_string();
+        assert!(err.contains("'deva'"), "message names the manifest's device: {err}");
+        assert!(err.contains("'devb'"), "message names this machine: {err}");
+    }
+
+    #[test]
+    fn spawn_paths_are_d13_device_names() {
+        // The frozen first-gen binary died here: agdl/agboot-ok/reboot2
+        // do not exist on the N4 image. These are the live D13 names.
+        assert_eq!(DOWNLOAD_BIN, "/usr/bin/aginx-download");
+        assert_eq!(BOOT_OK_BIN, "/usr/bin/aginx-boot-ok");
+        assert_eq!(REBOOT_BIN, "/usr/bin/aginx-reboot");
+    }
+}
