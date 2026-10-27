@@ -4,12 +4,35 @@
 # baize:examples=baize day / baize k rulings / baize k verify
 # baize:group=core
 set -eu
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+B=$(dirname "$SELF")
+ROOT=$(cd "$B/.." && pwd)
+
+# 出生礼（安装正典 §8）：BAIZE_HOME 空家且本包带 seed → 铺底模。
+# 一次性条件门：已有 AGENTS.md（有记忆的机器）永不触碰——多白泽铁律。
+BH="${BAIZE_HOME:-}"
+if [ -n "$BH" ] && [ ! -f "$BH/AGENTS.md" ]; then
+  SEED=""
+  [ -d "$ROOT/files/seed" ] && SEED="$ROOT/files/seed"
+  [ -z "$SEED" ] && [ -d "$ROOT/seed" ] && SEED="$ROOT/seed"
+  if [ -n "$SEED" ] && [ -f "$SEED/AGENTS.md" ]; then
+    mkdir -p "$BH"
+    cp -R "$SEED/." "$BH/"
+    CT="${BAIZE_CRONTABS:-/etc/crontabs}"   # 测试腿可覆写；设备走真根
+    if [ -d "$CT" ] && ! grep -q "baize night" "$CT/root" 2>/dev/null; then
+      printf '47 23 * * * BAIZE_HOME=%s /var/bin/baize night\n' "$BH" >> "$CT/root"
+      touch "$CT"   # crond 目录 mtime 雷
+      echo "baize: 心跳已接（${CT}/root 23:47）" >&2
+    fi
+    echo "baize: 出生礼完成（seed → ${BH}，白泽睁眼）" >&2
+  fi
+fi
+
 case "${1:-}" in
   ""|-h|--help)
     echo "usage: baize <day|night|harvest|adopt|k> [args…]" ;;
   day|night|harvest|adopt|k)
-    exec "$ROOT/bin/baize-$@" ;;
+    exec "$B/baize-$@" ;;
   *)
     echo "baize: 未知腿 $1" >&2; exit 2 ;;
 esac

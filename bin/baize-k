@@ -4,8 +4,11 @@
 # baize:examples=rulings
 # baize:group=memory
 set -eu
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
-H="${BAIZE_HOME:-$ROOT/home}"
+B=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+ROOT=$(cd "$B/.." && pwd)
+if [ -n "${BAIZE_HOME:-}" ]; then H="$BAIZE_HOME"
+elif [ -f "$ROOT/home/AGENTS.md" ]; then H="$ROOT/home"
+else echo "baize-k: 需要 BAIZE_HOME（安装正典 §8）" >&2; exit 2; fi
 K="$H/knowledge"
 
 field() { sed -n "s/^$2: *//p" "$1" | head -n 1; }

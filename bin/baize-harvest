@@ -5,12 +5,24 @@
 # v0 只收主人侧发言（user 消息）——拍板与口令的真源；劳力侧长文不进
 # 材料。任何 key=value 形态的秘密一律打码后才落 traces。
 set -eu
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
-H="${BAIZE_HOME:-$ROOT/home}"
+B=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+ROOT=$(cd "$B/.." && pwd)
+if [ -n "${BAIZE_HOME:-}" ]; then H="$BAIZE_HOME"
+elif [ -f "$ROOT/home/AGENTS.md" ]; then H="$ROOT/home"
+else echo "baize-harvest: 需要 BAIZE_HOME（安装正典 §8）" >&2; exit 2; fi
 T="$H/traces"; mkdir -p "$T"
 DAY=$(date +%F)
 PROJ="$HOME/.claude/projects"
-if [ $# -gt 0 ]; then DIRS=$@; else DIRS="$PROJ/-Users-sophiehe-Documents-baize $PROJ/-Users-sophiehe-Documents-aginxos-next"; fi
+if [ $# -gt 0 ]; then DIRS=$@; else DIRS=$(echo "$PROJ"/*baize* "$PROJ"/*aginxos* 2>/dev/null); fi
+
+# 打码腿：优先 perl（Mac 在役正则），无 perl 的 busybox 机器走 sed 等价版
+redact() {
+  if command -v perl >/dev/null 2>&1; then
+    perl -pe 's/(psk|api[_-]?key|apikey|secret|token|password)(\s*[=:：]\s*)["'"'"']?[A-Za-z0-9\@#%\^&\*_\-]{6,}/$1$2«REDACTED»/gi'
+  else
+    sed -E 's/([pP][sS][kK]|[aA][pP][iI][_\-]?[kK][eE][yY]|[aA][pP][iI][kK][eE][yY]|[sS][eE][cC][rR][eE][tT]|[tT][oO][kK][eE][nN]|[pP][aA][sS][sS][wW][oO][rR][dD])([[:space:]]*[=:：][[:space:]]*)["'"'"']?[A-Za-z0-9@#%^&*_-]{6,}/\1\2«REDACTED»/g'
+  fi
+}
 
 OUT="$T/$DAY-sessions.md"; : > "$OUT"
 n=0
@@ -21,7 +33,7 @@ for d in $DIRS; do
       echo "===== 会话 ${f##*/} ====="
       jq -r 'select(.type=="user") | .message.content | if type=="string" then . else ([.[]? | select(.type=="text") | .text] | join("\n")) end' "$f" 2>/dev/null \
         | grep -v '^$' \
-        | perl -pe 's/(psk|api[_-]?key|apikey|secret|token|password)(\s*[=:：]\s*)["'"'"']?[A-Za-z0-9\@#%\^&\*_\-]{6,}/$1$2«REDACTED»/gi' \
+        | redact \
         | head -c 24000
       echo
     } >> "$OUT"

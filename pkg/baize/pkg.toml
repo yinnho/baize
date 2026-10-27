@@ -1,0 +1,22 @@
+# baize — 白泽心跳与出厂底模（core 包，v0.1.0）
+#
+# 心 = 记忆整理循环；种 = 出厂 seed。系统=数字世界里的人：一台设备
+# 一个人，多白泽、无同步、无主从（世界模型见 seed）。
+#
+# 腿（全是 sh+jq，PATH 面 CLI，不注册 aginx 命令面——姓=baize）：
+#   baize day      心跳：当日材料→引擎整理→候选三关→正典+版本账
+#                  （--stub = 不烧脑测试腿）
+#   baize night    夜巡入口（crontab 23:47：harvest + day）
+#   baize harvest  收割当日材料（秘密打码；traces 永不入库）
+#   baize k        知识面：list / show / rulings / gaps / verify / roster
+#   baize adopt    认祖归宗：旧身体正典一次性血缘继承（不是同步）
+#
+# 出生礼（安装正典 §8）：BAIZE_HOME 指向空家时首次调用自动铺 seed
+# （AGENTS.md + 四件通用正典 + 空名册）并接 23:47 心跳。已有记忆的
+# 机器（家中有 AGENTS.md）永不触碰。
+name = "baize"
+version = "0.1.0"
+summary = "白泽心跳与出厂底模：五腿 + seed（空家自动出生礼）"
+group = "core"
+url = "https://pkgs.aginx.net/baize/v0.1.0/baize-v0.1.0-4pc.tar"
+exec = "bin/baize"

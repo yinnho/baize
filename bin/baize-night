@@ -2,6 +2,7 @@
 # baize:summary=夜巡：收割当日会话→心跳整理（crontab 入口，23:47 同二代时辰）
 # baize:group=memory
 set -eu
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
-"$ROOT/bin/baize-harvest"
-"$ROOT/bin/baize-day"
+B=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+if [ -z "${BAIZE_HOME:-}" ]; then echo "baize-night: 需要 BAIZE_HOME（crontab 23:47 腿自带）" >&2; exit 2; fi
+"$B/baize-harvest"
+"$B/baize-day"

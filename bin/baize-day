@@ -6,8 +6,11 @@
 # 才 mv 进正典；名册从正典派生重建；版本账 append-only。
 set -eu
 
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
-H="${BAIZE_HOME:-$ROOT/home}"
+B=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+ROOT=$(cd "$B/.." && pwd)
+if [ -n "${BAIZE_HOME:-}" ]; then H="$BAIZE_HOME"
+elif [ -f "$ROOT/home/AGENTS.md" ]; then H="$ROOT/home"       # 开发检出走仓内家
+else echo "baize-day: 需要 BAIZE_HOME（安装正典 §8）" >&2; exit 2; fi
 K="$H/knowledge"; T="$H/traces"
 mkdir -p "$K" "$T" "$H/history"
 
@@ -18,6 +21,12 @@ if [ $# -gt 0 ]; then
   TRACES=$@
 else
   TRACES=$(ls "$T"/$(date +%F)*.md 2>/dev/null || true)
+fi
+# --stub 允许零材料（出生验收：空家首跑必须绿）
+if [ -z "$TRACES" ] && [ "$STUB" -eq 1 ]; then
+  M="$T/$(date +%F)-birth-stub.md"
+  printf '出生自检材料：这是%s在空家上的第一条心跳测试。\n' 白泽 > "$M"
+  TRACES="$M"
 fi
 [ -n "$TRACES" ] || { echo "baize-day: 无当日材料（$T/$(date +%F)*.md）"; exit 0; }
 
@@ -71,7 +80,7 @@ done
 ADDED=$(echo "$ADDED" | sed 's/,$//;s/^ //')
 
 # 名册=派生物，从正典重建（单一出处=bin/baize-k roster）
-"$ROOT/bin/baize-k" roster
+"$B/baize-k" roster
 
 # 版本账（append-only）
 printf '{"ts":"%s","day":"%s","engine":"%s","added":[%s]}\n' \

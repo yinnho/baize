@@ -8,8 +8,11 @@
 # date（取 mtime）；原 source/confidence/尾部溯源行原样保留。过不了
 # 三关的进 rejects 报告，不静默丢。
 set -eu
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
-H="${BAIZE_HOME:-$ROOT/home}"
+B=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+ROOT=$(cd "$B/.." && pwd)
+if [ -n "${BAIZE_HOME:-}" ]; then H="$BAIZE_HOME"
+elif [ -f "$ROOT/home/AGENTS.md" ]; then H="$ROOT/home"
+else echo "baize-adopt: 需要 BAIZE_HOME（安装正典 §8）" >&2; exit 2; fi
 K="$H/knowledge"; mkdir -p "$K"
 SRC=${1:?usage: baize-adopt <srcdir>}
 
