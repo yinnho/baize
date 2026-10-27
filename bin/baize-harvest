@@ -11,9 +11,12 @@ if [ -n "${BAIZE_HOME:-}" ]; then H="$BAIZE_HOME"
 elif [ -f "$ROOT/home/AGENTS.md" ]; then H="$ROOT/home"
 else echo "baize-harvest: 需要 BAIZE_HOME（安装正典 §8）" >&2; exit 2; fi
 T="$H/traces"; mkdir -p "$T"
+PATH="$PATH:/var/bin"
 DAY=$(date +%F)
-PROJ="$HOME/.claude/projects"
-if [ $# -gt 0 ]; then DIRS=$@; else DIRS=$(echo "$PROJ"/*baize* "$PROJ"/*aginxos* 2>/dev/null); fi
+PROJ="${BAIZE_HOME:-$HOME}/.claude/projects"
+if [ $# -gt 0 ]; then DIRS=$@; else if [ -n "${BAIZE_HOME:-}" ]; then DIRS=$(echo "$PROJ"/* 2>/dev/null); else DIRS=$(echo "$PROJ"/*baize* "$PROJ"/*aginxos* 2>/dev/null); fi; fi
+# busybox find 不认 -newermt（现场抓获）——当日门=touch 戳文件 + -newer
+STAMP=$(mktemp /tmp/.bh.XXXXXX); touch -t "$(date +%Y%m%d0000)" "$STAMP"
 
 # 打码腿：优先 perl（Mac 在役正则），无 perl 的 busybox 机器走 sed 等价版
 redact() {
@@ -28,7 +31,7 @@ OUT="$T/$DAY-sessions.md"; : > "$OUT"
 n=0
 for d in $DIRS; do
   [ -d "$d" ] || continue
-  for f in $(find "$d" -maxdepth 1 -name '*.jsonl' -newermt "$DAY 00:00:00" 2>/dev/null); do
+  for f in $(find "$d" -maxdepth 1 -name '*.jsonl' -newer "$STAMP" 2>/dev/null); do
     {
       echo "===== 会话 ${f##*/} ====="
       jq -r 'select(.type=="user") | .message.content | if type=="string" then . else ([.[]? | select(.type=="text") | .text] | join("\n")) end' "$f" 2>/dev/null \
@@ -40,5 +43,6 @@ for d in $DIRS; do
     n=$((n+1))
   done
 done
-if [ $n -eq 0 ]; then echo "baize-harvest: 今日无会话"; exit 0; fi
+if [ $n -eq 0 ]; then echo "baize-harvest: 今日无会话"; rm -f "$STAMP"; exit 0; fi
+rm -f "$STAMP"
 echo "baize-harvest: $n 个会话 → $OUT ($(wc -c < "$OUT" | tr -d ' ')B)"

@@ -7,6 +7,8 @@
 set -eu
 
 B=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+if [ -f /etc/aginx/env ]; then set -a; . /etc/aginx/env; set +a; fi
+PATH="$PATH:/var/bin"
 ROOT=$(cd "$B/.." && pwd)
 if [ -n "${BAIZE_HOME:-}" ]; then H="$BAIZE_HOME"
 elif [ -f "$ROOT/home/AGENTS.md" ]; then H="$ROOT/home"       # 开发检出走仓内家
@@ -58,7 +60,11 @@ if [ "$STUB" -eq 1 ]; then
   printf -- '---\nname: stub-beat\ndescription: 测试心跳件\ntype: fact\ndate: %s\n---\n\n测试材料已被整理。\n' "$(date +%F)" > "$OUT/stub-beat.md"
 else
   git -C "$OUT" init -q 2>/dev/null || true
-  ( cd "$OUT" && ${BAIZE_ENGINE:-codex exec --sandbox workspace-write} - < "$STAGE/PROMPT.md" >"$STAGE/engine.log" 2>&1 ) \
+  if [ -z "${BAIZE_ENGINE:-}" ]; then
+    if command -v claude >/dev/null 2>&1; then BAIZE_ENGINE="claude --dangerously-skip-permissions -p --model claude-sonnet-4-5"
+    else BAIZE_ENGINE="codex exec --sandbox workspace-write -"; fi
+  fi
+  ( cd "$OUT" && ${BAIZE_ENGINE} < "$STAGE/PROMPT.md" >"$STAGE/engine.log" 2>&1 ) \
     || { echo "baize-day: 引擎失败——$STAGE/engine.log 尾:"; tail -5 "$STAGE/engine.log" 2>/dev/null; exit 1; }
 fi
 
@@ -84,7 +90,7 @@ ADDED=$(echo "$ADDED" | sed 's/,$//;s/^ //')
 
 # 版本账（append-only）
 printf '{"ts":"%s","day":"%s","engine":"%s","added":[%s]}\n' \
-  "$(date +%FT%T)" "$(date +%F)" "$([ $STUB -eq 1 ] && echo stub || echo codex)" "$ADDED" \
+  "$(date +%FT%T)" "$(date +%F)" "$([ $STUB -eq 1 ] && echo stub || echo "${BAIZE_ENGINE%% *}")" "$ADDED" \
   >> "$H/history/versions.jsonl"
 
 echo "baize-day: 落位 ${ADDED}（名册重建、版本账+1）"
