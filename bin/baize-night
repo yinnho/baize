@@ -1,0 +1,7 @@
+#!/bin/sh
+# baize:summary=夜巡：收割当日会话→心跳整理（crontab 入口，23:47 同二代时辰）
+# baize:group=memory
+set -eu
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+"$ROOT/bin/baize-harvest"
+"$ROOT/bin/baize-day"

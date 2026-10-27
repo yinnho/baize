@@ -1,0 +1,54 @@
+#!/bin/sh
+# baize:summary=白泽知识面：正典名册/考卷/缺口/体检
+# baize:args=list | show <name> | rulings | gaps | verify
+# baize:examples=rulings
+# baize:group=memory
+set -eu
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+H="${BAIZE_HOME:-$ROOT/home}"
+K="$H/knowledge"
+
+field() { sed -n "s/^$2: *//p" "$1" | head -n 1; }
+
+each() { # each <type|->
+  for f in "$K"/*.md; do
+    [ -f "$f" ] || continue
+    if [ "$1" != "-" ] && [ "$(field "$f" type)" != "$1" ]; then continue; fi
+    printf '%s\t%s\t%s\n' "$(field "$f" type)" "$(field "$f" name)" "$(field "$f" description)"
+  done
+}
+
+case "${1:-list}" in
+  list)    each - ;;
+  rulings) each ruling ;;
+  gaps)    each gap ;;
+  show)    [ -f "$K/$2.md" ] || { echo "no such: $2" >&2; exit 1; }; cat "$K/$2.md" ;;
+  roster)
+    {
+      echo '# 白泽正典名册'
+      echo
+      for f in "$K"/*.md; do
+        [ -f "$f" ] || continue
+        b=${f##*/}
+        echo "- [$(field "$f" name)](knowledge/$b) — $(field "$f" description)"
+      done
+    } > "$H/MEMORY.md"
+    echo "roster: 重建 $(ls "$K"/*.md 2>/dev/null | wc -l | tr -d ' ') 件" ;;
+  verify)
+    rc=0
+    for f in "$K"/*.md; do
+      [ -f "$f" ] || continue
+      b=${f##*/}; b=${b%.md}
+      head -n1 "$f" | grep -q '^---$' || { echo "no-frontmatter: $b"; rc=1; }
+      [ -n "$(field "$f" description)" ] || { echo "empty-description: $b"; rc=1; }
+      [ "$(field "$f" name)" = "$b" ] || { echo "name!=file: $b"; rc=1; }
+      if [ "$(field "$f" type)" = ruling ]; then
+        grep -q '^## 场景' "$f" || { echo "ruling-缺场景段: $b"; rc=1; }
+        grep -q '^## 钦定' "$f" || { echo "ruling-缺钦定段: $b"; rc=1; }
+      fi
+      grep -q "knowledge/$b" "$H/MEMORY.md" || { echo "not-in-roster: $b"; rc=1; }
+    done
+    [ $rc -eq 0 ] && echo "verify: ok"
+    exit $rc ;;
+  *) echo "usage: k list | show <name> | rulings | gaps | verify" >&2; exit 2 ;;
+esac

@@ -1,0 +1,32 @@
+#!/bin/sh
+# baize:summary=收割当日会话真源→traces 材料（session log = truth source）
+# baize:args=[项目dir…]（缺省=baize+aginxos-next 两 key）
+# baize:group=memory
+# v0 只收主人侧发言（user 消息）——拍板与口令的真源；劳力侧长文不进
+# 材料。任何 key=value 形态的秘密一律打码后才落 traces。
+set -eu
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+H="${BAIZE_HOME:-$ROOT/home}"
+T="$H/traces"; mkdir -p "$T"
+DAY=$(date +%F)
+PROJ="$HOME/.claude/projects"
+if [ $# -gt 0 ]; then DIRS=$@; else DIRS="$PROJ/-Users-sophiehe-Documents-baize $PROJ/-Users-sophiehe-Documents-aginxos-next"; fi
+
+OUT="$T/$DAY-sessions.md"; : > "$OUT"
+n=0
+for d in $DIRS; do
+  [ -d "$d" ] || continue
+  for f in $(find "$d" -maxdepth 1 -name '*.jsonl' -newermt "$DAY 00:00:00" 2>/dev/null); do
+    {
+      echo "===== 会话 ${f##*/} ====="
+      jq -r 'select(.type=="user") | .message.content | if type=="string" then . else ([.[]? | select(.type=="text") | .text] | join("\n")) end' "$f" 2>/dev/null \
+        | grep -v '^$' \
+        | perl -pe 's/(psk|api[_-]?key|apikey|secret|token|password)(\s*[=:：]\s*)["'"'"']?[A-Za-z0-9\@#%\^&\*_\-]{6,}/$1$2«REDACTED»/gi' \
+        | head -c 24000
+      echo
+    } >> "$OUT"
+    n=$((n+1))
+  done
+done
+if [ $n -eq 0 ]; then echo "baize-harvest: 今日无会话"; exit 0; fi
+echo "baize-harvest: $n 个会话 → $OUT ($(wc -c < "$OUT" | tr -d ' ')B)"

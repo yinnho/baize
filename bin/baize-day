@@ -1,0 +1,81 @@
+#!/bin/sh
+# baize:summary=白泽心跳：当日材料→引擎整理→正典落位+版本账
+# baize:args=[--stub] [trace文件…]（缺省=traces/今日*.md）
+# baize:group=memory
+# 验收纪律：候选不落位不算数——frontmatter/description/name 三关过了
+# 才 mv 进正典；名册从正典派生重建；版本账 append-only。
+set -eu
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+H="${BAIZE_HOME:-$ROOT/home}"
+K="$H/knowledge"; T="$H/traces"
+mkdir -p "$K" "$T" "$H/history"
+
+STUB=0
+case "${1:-}" in --stub) STUB=1; shift ;; esac
+
+if [ $# -gt 0 ]; then
+  TRACES=$@
+else
+  TRACES=$(ls "$T"/$(date +%F)*.md 2>/dev/null || true)
+fi
+[ -n "$TRACES" ] || { echo "baize-day: 无当日材料（$T/$(date +%F)*.md）"; exit 0; }
+
+STAGE=$(mktemp -d "${TMPDIR:-/tmp}/baize-day.XXXXXX"); OUT="$STAGE/out"; mkdir "$OUT"
+trap 'rm -rf "$STAGE"' EXIT
+
+# 整理工单（引擎劳力照单干活）
+{
+  cat <<'EOF'
+你是白泽的记忆整理工。白泽是一个人的化身（人格件随后）。把下面材料
+整理成正典知识件，写到当前目录：
+
+- 一事一档，文件名=name.md（kebab-case slug）。
+- frontmatter：name / description（一句话，非空）/ type / date（YYYY-MM-DD）。
+- type：fact=事实；ruling=主人拍板（必须含「## 场景」「## 钦定」两段）；
+  gap=发现的未知或待裁。
+- 材料与已有正典同题→重写同名文件，不另立新档。
+- 只写知识件 .md，不改其他文件；提炼不抄原文长段；秘密（密钥/口令）
+  永不写入。
+
+EOF
+  echo '===== 人格件 home/AGENTS.md ====='; cat "$H/AGENTS.md"
+  echo; echo '===== 正典名册 home/MEMORY.md ====='; cat "$H/MEMORY.md"
+  for t in $TRACES; do echo; echo "===== 当日材料 $t ====="; cat "$t"; done
+} > "$STAGE/PROMPT.md"
+
+# 引擎干活：沙箱=临时 OUT 目录（git init 防 exec 的 repo 检查）
+if [ "$STUB" -eq 1 ]; then
+  printf -- '---\nname: stub-beat\ndescription: 测试心跳件\ntype: fact\ndate: %s\n---\n\n测试材料已被整理。\n' "$(date +%F)" > "$OUT/stub-beat.md"
+else
+  git -C "$OUT" init -q 2>/dev/null || true
+  ( cd "$OUT" && ${BAIZE_ENGINE:-codex exec --sandbox workspace-write} - < "$STAGE/PROMPT.md" >"$STAGE/engine.log" 2>&1 ) \
+    || { echo "baize-day: 引擎失败——$STAGE/engine.log 尾:"; tail -5 "$STAGE/engine.log" 2>/dev/null; exit 1; }
+fi
+
+# 验收三关（过了才落位）
+fail() { echo "baize-day: $*" >&2; exit 1; }
+ADDED=""
+for f in "$OUT"/*.md; do
+  [ -f "$f" ] || continue
+  b=${f##*/}; b=${b%.md}
+  head -n1 "$f" | grep -q '^---$' || fail "候选缺frontmatter: $b"
+  d=$(sed -n 's/^description: *//p' "$f" | head -n1)
+  n=$(sed -n 's/^name: *//p' "$f" | head -n1)
+  [ -n "$d" ] || fail "候选description空: $b（空desc=件永不落位）"
+  [ "$n" = "$b" ] || fail "候选name≠文件名: $n vs $b"
+  mv "$f" "$K/$b.md"
+  ADDED="$ADDED \"$b.md\","
+done
+[ -n "$ADDED" ] || fail "引擎零产出（engine.log 见上）"
+ADDED=$(echo "$ADDED" | sed 's/,$//;s/^ //')
+
+# 名册=派生物，从正典重建（单一出处=bin/k roster）
+"$ROOT/bin/k" roster
+
+# 版本账（append-only）
+printf '{"ts":"%s","day":"%s","engine":"%s","added":[%s]}\n' \
+  "$(date +%FT%T)" "$(date +%F)" "$([ $STUB -eq 1 ] && echo stub || echo codex)" "$ADDED" \
+  >> "$H/history/versions.jsonl"
+
+echo "baize-day: 落位 ${ADDED}（名册重建、版本账+1）"

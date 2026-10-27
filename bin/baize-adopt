@@ -1,0 +1,55 @@
+#!/bin/sh
+# baize:summary=认祖归宗：归一化导入旧身体的正典件（旧记忆认领进本尊）
+# baize:args=<srcdir>（旧正典 *.md 所在目录）
+# baize:examples=baize-adopt .local/redfin-import/knowledge
+# baize:group=memory
+# 归一化（只动结构不动语义）：补 description=正文首行截80；ruling 的
+# 「**场景**：/**裁决**：」改写为「## 场景/## 钦定」；补 origin 与缺省
+# date（取 mtime）；原 source/confidence/尾部溯源行原样保留。过不了
+# 三关的进 rejects 报告，不静默丢。
+set -eu
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+H="${BAIZE_HOME:-$ROOT/home}"
+K="$H/knowledge"; mkdir -p "$K"
+SRC=${1:?usage: baize-adopt <srcdir>}
+
+norm() { # norm <in> <out> <origin> <date>
+  first=$(awk 'c==2 && NF {print; exit} /^---$/{c++}' "$1")
+  [ -n "$first" ] || first=$1
+  first=$(printf '%s' "$first" | sed 's/^\*\*场景\*\*：*//; s/^\*\*裁决\*\*：*//; s/^[-*# >]*//')
+  desc=$(printf '%s' "$first" | perl -CSD -ne 'chomp; print substr($_, 0, 60)')
+  awk -v desc="$desc" -v org="$3" -v dt="$4" '
+    NR==1 { fm = ($0 == "---") ? 1 : 0 }
+    fm==1 && !closed && NR>1 && $0=="---" {
+      if (!hasdesc) print "description: " desc
+      print "origin: " org
+      if (!hasdate) print "date: " dt
+      print "---"; closed=1; next
+    }
+    fm==1 && !closed {
+      if ($0 ~ /^description:/) hasdesc=1
+      if ($0 ~ /^date:/) hasdate=1
+      print; next
+    }
+    /\*\*场景\*\*/ { sub(/\*\*场景\*\*[:：]*/, "## 场景") }
+    /\*\*裁决\*\*/ { sub(/\*\*裁决\*\*[:：]*/, "## 钦定") }
+    { print }
+  ' "$1" > "$2"
+}
+
+ok=0; rej=0; REJ=""
+mkdir -p "$ROOT/.local/adopt-rejects"
+for f in "$SRC"/*.md; do
+  [ -f "$f" ] || continue
+  b=${f##*/}
+  tmp=$(mktemp)
+  norm "$f" "$tmp" "${2:-redfin}" "$(date -r "$f" +%F)"
+  d=$(sed -n 's/^description: *//p' "$tmp" | head -n1)
+  if head -n1 "$tmp" | grep -q '^---$' && [ -n "$d" ]; then
+    mv "$tmp" "$K/$b"; ok=$((ok+1))
+  else
+    mv "$tmp" "$ROOT/.local/adopt-rejects/$b"; rej=$((rej+1)); REJ="$REJ $b"
+  fi
+done
+"$ROOT/bin/k" roster
+echo "baize-adopt: 认领 $ok 件，拒 $rej 件${REJ:+ →$REJ}（.local/adopt-rejects/）"
