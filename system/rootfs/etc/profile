@@ -1,7 +1,8 @@
 # Login-shell PATH — /var/bin holds the package faces (aginx,
-# aginx-voice, python3, codex …). rcS exports it for daemons; ssh
-# interactive shells read it here. (dropbear "ssh host cmd" is a
-# non-login shell — use absolute paths there.)
+# aginx-voice, python3, codex …). Login shells read it here.
+# Daemons and service units use absolute /var/bin/<name> (rcS PATH
+# does not include /var/bin). dropbear "ssh host cmd" is a non-login
+# shell — use absolute paths there.
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/var/bin
 # 机器时区（#62）：dropbear 从 inittab 生、不吃 rcS 的 env——登录 shell
 # 在此自读（机型盲 sed，与 rcS 同律）。ssh 里 date 从此本地时，收据
