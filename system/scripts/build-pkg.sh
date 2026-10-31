@@ -706,6 +706,19 @@ case "${PKG}" in
     done
     MEMBERS="pkg.toml SKILL.md files"
     ;;
+  aginx-netgate | aginx-home-migrate | aginx-agent-usage)
+    # 定稿成码轮三件（2026-10-31，NETWORK-SURFACE v2 P0 + omacom 新轮）：
+    # 各单 bin → files/bin/；PATH 面 CLI 不铸 aginx 命令面（无 sidecar，
+    # sqlite3/git 口味）。netgate=监听盘点门（夜巡门腿第一枪）、
+    # home-migrate=人格树迁移层、agent-usage=引擎用量归一。
+    echo "==> zigbuild ${PKG}（musl，缓存则秒过）"
+    (cd "${ROOT}" && cargo zigbuild --release --target aarch64-unknown-linux-musl -p "${PKG}")
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${TARGET_DIR}/${PKG}" "${STAGE}/files/bin/${PKG}"
+    file "${STAGE}/files/bin/${PKG}" | grep -q "statically linked" \
+      || { echo "FATAL: ${PKG} 非 musl 静态（$(file "${STAGE}/files/bin/${PKG}")）" >&2; exit 1; }
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
   *)
     echo "FATAL: 未知包名 ${PKG}（… / aginx-api / aginx-boot-ok …）" >&2
     exit 1
