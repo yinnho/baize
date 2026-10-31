@@ -1,0 +1,14 @@
+# gateway-local — 本机 ACP 口缺省（#68 ②b；真源=/etc/aginx/gateway-local.toml，
+# 壳首启拷贝此件，已存在不覆写）。
+# direct 模式只听回环；数据世界与 relay 腿分家（AGINX_DATA_DIR=
+# /var/lib/aginx/gateway-local，sessions/spool 整文件写不共世界），
+# agents 符号链回 ../gateway/agents——名册单一寻址点。
+[server]
+mode = "direct"
+host = "127.0.0.1"
+port = 8686
+# 仅回环可及（127.0.0.1 绑定即门）。桥带 authToken 腿：[[local_clients]]
+# 表铸 principal（token/name/principal 三字段，如 weixin 桥=
+# svc:weixin-bridge），token 真源设备侧 /etc/aginx/env，随桥单元
+# env_file 注入；无 token 的本机匿名客户端仍走 anon（PseudoBound）。
+access = "public"

@@ -14,3 +14,4 @@ files=file read/write/list/convert tools (aginx-file package)
 mem=memory tools: kv, tree, knowledge, flows (aginx-mem package)
 sec=secret store admin: set, get, rm, list, sign (aginx-secretd sidecar)
 backup=local state backup: snapshot, list, verify, retention
+api=external REST api legs (aginx-api: token/draft/material)

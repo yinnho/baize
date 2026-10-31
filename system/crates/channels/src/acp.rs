@@ -197,11 +197,14 @@ impl AcpClient {
 
     /// One prompt per connection（ACP 语义：连接=会话腿，直连模式服务器
     /// 本就一连接一请求序列；简单诚实，不做连接池）。
+    ///
+    /// `conversation`：HARNESS 刀A 对话键（单聊=sender）。网关在 policy.enabled
+    /// 时逐轮装配，不再回喂 sessionId/--resume。
     pub fn prompt(
         &self,
         agent: &str,
         message: &str,
-        resume_session: Option<&str>,
+        conversation: Option<&str>,
     ) -> Result<AcpReply> {
         let deadline = Instant::now() + self.timeout;
         let connect_timeout = self.timeout.min(Duration::from_secs(10));
@@ -228,10 +231,10 @@ impl AcpClient {
         self.send_line(&mut stream, &init)?;
         self.wait_response(&mut stream, 1, deadline, None)?; // 无 chunk 期
 
-        // prompt（无 ack，直接读流）
+        // prompt（无 ack，直接读流）——聊天面传 conversation，不传 sessionId
         let mut params = serde_json::json!({ "agent": agent, "message": message });
-        if let Some(sid) = resume_session.filter(|s| !s.is_empty()) {
-            params["sessionId"] = serde_json::json!(sid);
+        if let Some(key) = conversation.filter(|s| !s.is_empty()) {
+            params["conversation"] = serde_json::json!(key);
         }
         let prompt = serde_json::json!({
             "jsonrpc": "2.0",
@@ -244,7 +247,7 @@ impl AcpClient {
         // 读到终帧：chunk 拼接，result 停
         let mut text = String::new();
         let mut media: Vec<AcpMedia> = Vec::new();
-        let mut session_id = resume_session.map(|s| s.to_string());
+        let mut session_id: Option<String> = None;
         let mut reader = BufReader::new(stream);
         loop {
             if Instant::now() >= deadline {

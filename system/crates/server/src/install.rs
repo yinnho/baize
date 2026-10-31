@@ -10,8 +10,14 @@
 //! 随 ④-4 crate 拆迁收口。
 //!
 //! 相对旧管线的裁剪：agent.toml（kernel manifest）不再写——codex 条目
-//! 不读它；flows/self-growth 种子不再落——flow 机制随引擎退役；
-//! knowledge/format-spec.md 仍种（clone-creator 读现行格式规则）。
+//! 不读它；knowledge/format-spec.md 仍种（`seed_format_spec`，clone-creator 读现行格式规则）。
+//!
+//! # P6 实测（2026-10-30）self-growth 种子
+//! 现役 `install` / `install_tar` **不**调用 `DEFAULT_SELF_GROWTH_FLOW`、**不**写
+//! `flows/self-growth/`——仅 `validate → write_files_to_workspace → seed_format_spec →
+//! gateway_registry::register`。`defaults::DEFAULT_SELF_GROWTH_FLOW` 仍导出给旧路径/
+//! 文档对照，但 **不是** 装机写腿。self-growth = idle 学/写稿闸（`self_growth_enabled`），
+//! **不是** 能力固化（`capability-persist.toml`）；两闸默认关、互不暗开。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

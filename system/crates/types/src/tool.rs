@@ -82,12 +82,15 @@ impl PermissionLevel {
             | "browser_wait" | "browser_back" | "browser_screenshot"
             | "browser_close"
             | "image_analyze" | "media_describe" | "media_transcribe"
-            | "speech_to_text" | "location_get" | "system_time" => Self::ReadOnly,
+            | "speech_to_text" | "location_get" | "system_time"
+            | "capability_t1_review" => Self::ReadOnly,
 
             // Write — writes within sandbox
             "file_write"
             | "knowledge_add" | "knowledge_remove" | "knowledge_import"
             | "knowledge_heal" | "flow_create" | "flow_update"
+            | "capability_propose" | "capability_accept" | "capability_t2_scan" | "capability_materialize_l2"
+            | "capability_register_l3" | "capability_unregister_l3"
             | "apply_patch" | "train_write"
             | "image_generate" | "text_to_speech" | "canvas_present"
             | "task_post" | "task_claim" | "task_complete"
@@ -155,6 +158,8 @@ pub fn is_admin_gated(name: &str) -> bool {
         || base == "data_analyze"
         || base == "train_write"
         || base == "knowledge_remove"
+        || base == "capability_register_l3"
+        || base == "capability_unregister_l3"
         || base.ends_with("publish_draft")
 }
 
@@ -439,6 +444,13 @@ pub const CORE_TOOL_NAMES: &[&str] = &[
     "flow_load",
     "flow_create",
     "flow_update",
+    "capability_propose",
+    "capability_accept",
+    "capability_t1_review",
+    "capability_t2_scan",
+    "capability_materialize_l2",
+    "capability_register_l3",
+    "capability_unregister_l3",
     "session_summarize",
     "knowledge_add",
     "knowledge_read",
@@ -496,6 +508,13 @@ mod tests {
         assert!(!is_admin_gated("flow_create"));
         assert!(!is_admin_gated("flow_update"));
         assert!(!is_admin_gated("knowledge_add"));
+        assert!(!is_admin_gated("capability_propose"));
+        assert!(!is_admin_gated("capability_accept"));
+        assert!(!is_admin_gated("capability_t1_review"));
+        assert!(!is_admin_gated("capability_t2_scan"));
+        assert!(!is_admin_gated("capability_materialize_l2"));
+        assert!(is_admin_gated("capability_register_l3"));
+        assert!(is_admin_gated("capability_unregister_l3"));
         assert!(!is_admin_gated("file_write"));
         assert!(!is_admin_gated("knowledge_heal"));
         assert!(!is_admin_gated("apply_patch"));

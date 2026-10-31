@@ -2,4 +2,5 @@
 # aginx:args=<url> <dest>
 # aginx:examples=https://pkgs.aginx.net/… /var/tmp/pkg.bin
 # aginx:group=pkg
+# aginx:hidden=true
 # 原名 agdl。

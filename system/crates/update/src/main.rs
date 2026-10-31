@@ -57,8 +57,16 @@
 //! `/usr/bin/agboot-ok` and `/bin/reboot2` — all renamed by the D13
 //! sweep, so on the N4 image apply died at the set-active step. The
 //! three spawn paths are now consts below, pinned by test.
+//!
+//! Lifecycle-dispatch (omacom borrow, 2026-10-31): verbs are a fixed set
+//! (`status|apply|capture|write-part|sha256` — anything else exits 2).
+//! `write-part` only accepts the fixed by-name leaf set below (no raw
+//! `/dev/sdX`, no path escape); helper bins must be regular files at the
+//! pinned paths (symlink refuse). Platform differences stay in
+//! `devices/<codename>/` — this crate never grows a codename branch.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
+use std::path::Path;
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
@@ -108,6 +116,71 @@ struct Manifest {
 const DOWNLOAD_BIN: &str = "/usr/bin/aginx-download";
 const BOOT_OK_BIN: &str = "/usr/bin/aginx-boot-ok";
 const REBOOT_BIN: &str = "/usr/bin/aginx-reboot";
+
+/// Fixed by-name leafs `write-part` may touch (A/B slot faces only).
+/// Adding one is a change to this crate — same law as omacom lifecycle-dispatch.
+/// `userdata` is intentionally absent: state/rootfs swap owns that device
+/// through the marker protocol, never the escape hatch.
+const ALLOWED_WRITE_PARTS: &[&str] = &[
+    "boot_a",
+    "boot_b",
+    "vendor_boot_a",
+    "vendor_boot_b",
+    "dtbo_a",
+    "dtbo_b",
+    "vbmeta_a",
+    "vbmeta_b",
+    "vbmeta_system_a",
+    "vbmeta_system_b",
+];
+
+/// Resolve a `write-part` argument to `/dev/block/by-name/<leaf>`.
+/// Accepts the bare leaf or the full by-name path; refuses everything else
+/// (path escape, unknown leaf, empty). Pure — unit-tested.
+fn resolve_write_part(arg: &str) -> Result<String, String> {
+    let name = arg
+        .strip_prefix("/dev/block/by-name/")
+        .unwrap_or(arg);
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains("..")
+        || name.starts_with('.')
+    {
+        return Err(format!(
+            "refusing: write-part wants a by-name leaf (got '{arg}') — not a raw device path"
+        ));
+    }
+    // If caller passed a full path, it must be exactly the by-name form.
+    if name != arg && arg != format!("/dev/block/by-name/{name}") {
+        return Err(format!(
+            "refusing: write-part path '{arg}' is not /dev/block/by-name/<leaf>"
+        ));
+    }
+    if !ALLOWED_WRITE_PARTS.contains(&name) {
+        return Err(format!(
+            "refusing: '{name}' is not in the fixed write-part set {:?} — not a lifecycle op",
+            ALLOWED_WRITE_PARTS
+        ));
+    }
+    Ok(format!("/dev/block/by-name/{name}"))
+}
+
+fn require_trusted_bin(path: &str) -> Result<(), String> {
+    let p = Path::new(path);
+    if !p.exists() {
+        return Ok(());
+    }
+    let meta = fs::symlink_metadata(p).map_err(|e| format!("stat {path}: {e}"))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "refusing: {path} is a symlink — lifecycle helpers must be regular files"
+        ));
+    }
+    if !meta.is_file() {
+        return Err(format!("refusing: {path} is not a regular file"));
+    }
+    Ok(())
+}
 
 // --- M22 rootfs-swap protocol (MUST match crates/aginxos-init) ---
 //
@@ -632,6 +705,7 @@ fn cmd_apply(src: &str, no_reboot: bool) {
             }
         }
     }
+    require_trusted_bin(BOOT_OK_BIN).unwrap_or_else(|e| die(&e));
     let st = Command::new(BOOT_OK_BIN)
         .arg("set-active").arg(tgt.trim_start_matches('_'))
         .status()
@@ -644,6 +718,7 @@ fn cmd_apply(src: &str, no_reboot: bool) {
         println!("aginx-update: --no-reboot given, not rebooting");
         return;
     }
+    require_trusted_bin(REBOOT_BIN).unwrap_or_else(|e| die(&e));
     Command::new(REBOOT_BIN).arg("reboot").status()
         .unwrap_or_else(|e| die(&format!("aginx-reboot: {e}")));
 }
@@ -678,11 +753,13 @@ fn main() {
             println!("{}", sha256_hex_file(f));
         }
         Some("write-part") => {
-            // escape hatch / test primitive: verified write, no slot logic
+            // Escape hatch / test primitive: verified write, no slot logic —
+            // but only onto the fixed by-name lifecycle set (omacom-style).
             let img = args.get(1).unwrap_or_else(|| die("usage: aginx-update write-part <img> <part>"));
             let part = args.get(2).unwrap_or_else(|| die("usage: aginx-update write-part <img> <part>"));
-            let n = write_part(img, part);
-            println!("aginx-update: {n} bytes → {part}");
+            let dev = resolve_write_part(part).unwrap_or_else(|e| die(&e));
+            let n = write_part(img, &dev);
+            println!("aginx-update: {n} bytes → {dev}");
         }
         _ => {
             eprintln!("usage: aginx-update <status|apply|capture|write-part|sha256> …");
@@ -958,5 +1035,68 @@ mod tests {
         assert_eq!(DOWNLOAD_BIN, "/usr/bin/aginx-download");
         assert_eq!(BOOT_OK_BIN, "/usr/bin/aginx-boot-ok");
         assert_eq!(REBOOT_BIN, "/usr/bin/aginx-reboot");
+    }
+
+    #[test]
+    fn resolve_write_part_fixed_set_pos_neg() {
+        // positive: bare leaf and full by-name path
+        assert_eq!(
+            resolve_write_part("boot_a").unwrap(),
+            "/dev/block/by-name/boot_a"
+        );
+        assert_eq!(
+            resolve_write_part("/dev/block/by-name/vendor_boot_b").unwrap(),
+            "/dev/block/by-name/vendor_boot_b"
+        );
+        // negative: raw device, traversal, unknown leaf, userdata (swap-owned)
+        for bad in [
+            "/dev/sda",
+            "/dev/block/sda1",
+            "../boot_a",
+            "boot_a/../../sda",
+            "/dev/block/by-name/../sda",
+            "userdata",
+            "boot", // unsuffixed — apply builds suffix itself; CLI must name the face
+            "",
+            "/dev/block/by-name/",
+        ] {
+            let err = resolve_write_part(bad).err().unwrap_or_else(|| panic!("must refuse {bad}"));
+            assert!(
+                err.contains("refusing"),
+                "refuse message for {bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn require_trusted_bin_refuses_symlink() {
+        let dir = tempfile_dir();
+        let target = dir.join("real");
+        let link = dir.join("link");
+        fs::write(&target, b"x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = require_trusted_bin(link.to_str().unwrap())
+            .err()
+            .expect("symlink must refuse");
+        assert!(err.contains("symlink"), "{err}");
+        // regular file ok
+        assert!(require_trusted_bin(target.to_str().unwrap()).is_ok());
+        // missing ok (Command dies later)
+        assert!(require_trusted_bin(dir.join("absent").to_str().unwrap()).is_ok());
+    }
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "aginx-update-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d
     }
 }

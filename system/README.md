@@ -20,4 +20,11 @@ bringup 收据层、构建产物（`target/`）、任何秘密（串号/密钥/�
 发布前审计门逐类扫描，零命中——测试桩除外）。
 
 烤整机镜像：`DEVICE=redfin ./scripts/build-rootfs.sh`（需自备
-`.local/` 资产；boot 件配方见 `devices/`）。License=Apache-2.0（同仓）。
+`.local/` 资产；boot 件配方见 `devices/`）。
+
+**本机 `.local`（2026-10-31）**：已是 baize 树内自有副本（非链到
+aginxos-next）；pack 只写 `system/.local/device/redfin/boot-out/`。布局见
+`.local/README.md` 与 `devices/redfin/boot/assets.md`。License=Apache-2.0（同仓）。
+
+**本机 `pkgs/`（2026-10-31）**：已是 baize 自有配方快照（非链到
+aginxos-next）；`local-pkgs/` 仍为特供 overlay（优先）。律见 `pkgs/README.md`。

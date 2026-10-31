@@ -24,6 +24,7 @@ members = [
     "crates/testkit",
     "crates/done",
     "crates/secret",
+    "crates/api",
     "crates/pair",
     "crates/hwd",
     "crates/wificonf",

@@ -27,6 +27,7 @@ anyhow.workspace = true
 carrier-types.workspace = true
 carrier-memory.workspace = true
 carrier-lifecycle.workspace = true
+aginx-server = { path = "../server" }
 clap.workspace = true
 libc.workspace = true
 rusqlite.workspace = true

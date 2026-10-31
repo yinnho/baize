@@ -17,3 +17,15 @@
 
 只有 sh 与 jq。**文件面即数据模型，db 是弯路。**人格树（正典、名册、
 版本账）与当日材料留在本地宿主，不进公开历史——记忆是私产。
+
+## 文档三树（omacom 对照 · baize 分层）
+
+对人 / 对 agent / 对系统——三入口，禁止混装：
+
+| 树 | 入口 | 受众 | 放什么 |
+|----|------|------|--------|
+| **对 agent** | [`AGENTS.md`](AGENTS.md)（仓规）+ [`home/AGENTS.md`](home/AGENTS.md)（人格）+ [`home/knowledge/`](home/knowledge/) | 干活的 agent | 规程、「做 X 先读」、正典；安装全文见 [`manual/01-install.md`](manual/01-install.md) |
+| **对系统** | [`docs/README.md`](docs/README.md) | 改机身 / 读形状 | DESIGN·PRODUCT·需求·进化轨；骨在 [`system/README.md`](system/README.md) |
+| **对人** | [`manual/README.md`](manual/README.md) | 主人 | 只写人要做的三事（递机器 / 递秘密 / 收汇报）；**禁止**机身内幕 |
+
+归位细则写在各入口 README。不搞大搬家：短索引就位，正文各留原处。

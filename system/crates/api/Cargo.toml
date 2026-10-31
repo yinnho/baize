@@ -1,0 +1,37 @@
+[package]
+name = "aginx-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# aginx-api — D17 api 腿运行时（2026-10-30）。扫 channels/<kind>/leg/api-leg.toml，
+# 账户选择器 → secretd 取 JSON 凭据，声明式 HTTP 工具（token 链 / error_check
+# expect_absent）。旁路 bin：aginx-mp-material-upload（multipart 封面）。
+# 纯 Rust；密文永不进日志/stdout。
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+agio = { path = "../agio" }
+aginx-secret = { path = "../secret" }
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+urlencoding = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+testkit = { path = "../testkit" }
+
+[[bin]]
+name = "aginx-api"
+path = "src/bin/aginx-api.rs"
+
+[[bin]]
+name = "aginx-mp-material-upload"
+path = "src/bin/aginx-mp-material-upload.rs"

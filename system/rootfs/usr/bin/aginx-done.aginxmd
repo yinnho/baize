@@ -3,4 +3,5 @@
 # aginx:examples=list
 # aginx:examples=check python-finalize
 # aginx:group=sys
+# aginx:hidden=true
 # 原名 agdone。

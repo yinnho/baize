@@ -17,9 +17,10 @@
 //!    本体（协议腿已从 CDN 拉下）先落 `{AGINX_HOME}/files/` 再进桥
 //!    （v0.1.8 前桥只留文件名，data 字节当场扔）。
 //!
-//! gw.json：`senders/<peer>/gw.json` {agent, session_id}——该发信人当前
-//! 对话挂在哪个 agent、哪条引擎会话上；换绑（bind 字段改了）后第一条
-//! 消息自动开新线程（agent 不一致即弃旧 sessionId）。
+//! gw.json：`senders/<peer>/gw.json` {agent, session_id?}——该发信人当前
+//! 挂在哪个 agent；`session_id` 仅作观测（引擎收割值）。HARNESS 后聊天面
+//! 传 `conversation=<sender_id>`，不再回喂 sessionId/--resume。换绑后第一条
+//! 消息弃旧状态开新线程。
 
 use crate::acp::AcpClient;
 use crate::config::{channels_root, ChannelConfig};
@@ -249,10 +250,12 @@ fn bridge_one(
         gw = GwState::default();
     }
 
-    info!(sender = %msg.sender_id, agent = %agent, session = ?gw.session_id, "bridge turn");
-    let (reply_text, reply_media) = match acp.prompt(&agent, &text, gw.session_id.as_deref()) {
+    info!(sender = %msg.sender_id, agent = %agent, conversation = %msg.sender_id, "bridge turn");
+    // HARNESS：传对话键，不再回喂引擎 sessionId
+    let (reply_text, reply_media) = match acp.prompt(&agent, &text, Some(msg.sender_id.as_str())) {
         Ok(r) => {
             gw.agent = agent;
+            // 收割值仅观测入库；下轮不回喂
             gw.session_id = r.session_id;
             write_gw(&gw_path, &gw);
             (r.text, r.media)

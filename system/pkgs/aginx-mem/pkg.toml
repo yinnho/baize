@@ -1,0 +1,29 @@
+# aginx-mem — 记忆面工具 CLI 的包形态（D13 改姓 2026-09-26，原 agmem v0.2.0）。
+# 母体 agmem_bridge spawn `aginx-mem tool <name>`（stdin=入参 JSON 含 _ctx
+# 三元组身份，stdout=D1 信封）；人面 = kv/tree/knowledge/flow 子命令。
+# 直开同一 sqlite（WAL 并发安全，M35a）。装包自动生成 .aginxmd sidecar。
+# v0.2.0（2026-10-10，日循环线上机）：+day/digest 两子命令 + 本 wrapper
+# + [cron] 23:55 腿——系统每晚自己整理当天（材料化→codex 分析→落账
+# knowledge/，缺口喂次日晨报）。设计=docs/日循环.md；day 材料绝不出设备。
+# v0.2.1（2026-10-24，裁决采集上线）：lifecycle 契约 KnowledgeCandidate
+# +kind/knowledge|ruling/+trigger——用户对系统行为的纠偏一律
+# kind:"ruling" 落 type: ruling 件（场景+钦定双段，confidence=DECIDED），
+# 日循环 Leg B prompt 同步教契约；digest 汇总/晨报自查段计裁决数；
+# 新面 `k rulings` 枚举裁决账（将来进化回路回放考卷的出口）。
+# v0.2.2（2026-10-24，汇报策略第一进化面）：wrapper +高优直推腿——
+# digest degraded（safety 类）即时推微信绑定会话；行为真源=
+# /home/policies/reporting.md（三级：立即推白名单/攒晨报/静默），
+# wrapper 只机械执行分级，未绑=SKIP 不炸。
+# v0.2.3-baize 错峰（2026-10-31）：[cron] 47→55，避开 baize night 23:47 争 codex；
+# 仍同日历日、避整点。版本号保持 0.2.3（仅 cron 时刻；sha 随配方变）。
+# v0.2.3（2026-10-30，能力固化轨 P0–P6）：+capability_propose/accept/t1_review/t2_scan/materialize_l2/register_l3/unregister_l3；总闸 /home/capability-persist.toml 默认关（或 CAPABILITY_PERSIST_ENABLED 测开）；≠ self_growth。母体对话面见 docs/SELF-EVOLUTION-DEPLOY.md（须另更 gateway/carrier 桥）。
+name = "aginx-mem"
+version = "0.2.3"
+summary = "记忆面工具：kv/tree/knowledge/flows + 日循环腿（day/digest 材料化落账，23:55 自整理；与 baize night 23:47 错峰）+ 裁决采集（ruling 一等件+考卷面）+ 高优直推（safety 类即时推微信）"
+group = "mem"
+url = "https://pkgs.aginx.net/aginx-mem/v0.2.3/aginx-mem-v0.2.3-4pc.tar"
+
+exec = "bin/aginx-mem"
+
+[cron]
+lines = ["55 23 * * * /var/lib/aginx/pkgfiles/aginx-mem/libexec/day-review.sh >> /var/log/day-review.log 2>&1"]

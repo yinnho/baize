@@ -1,0 +1,17 @@
+# aginx-api — D17 api 腿运行时包。
+# v0.1.2（2026-10-31）：resolve cli 裸名优先解析 /var/bin（ssh PATH 无该前缀）。
+# v0.1.1（2026-10-30）：admin ↔ publish_admin_gate 联检；list 默认藏 admin；
+#   [tool.resolve] 链式抽值（账户/secretd/前步工具/CLI）。
+# v0.1.0：扫 api-leg.toml + secretd；token/draft；旁路封面上传。
+# 配方住 system/local-pkgs/；不进封仓 aginxos-next/pkgs。
+name = "aginx-api"
+version = "0.1.2"
+summary = "D17 api 腿：gate 联检 + resolve 链（/var/bin cli）；token/draft；封面上传"
+group = "api"
+url = "https://pkgs.aginx.net/aginx-api/v0.1.2/aginx-api-v0.1.2-4pc.tar"
+exec = "bin/aginx-api"
+args = "list [--channel KIND] [--include-admin] | run <tool> [--param k=v] [--admin]"
+examples = [
+  "list --channel weixin-oa",
+  "run weixin_mp_draft_add --param cover_file=/tmp/cover.png --param title=…",
+]

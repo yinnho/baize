@@ -1,0 +1,177 @@
+#!/bin/sh
+# Network bring-up (M5 → 开机剧情 #246 phase split) — two phases, one file.
+#
+# Phase 1, the LOCAL verdict: wait for radio-bringup's wlan0 and the
+# sibling bring-up verdicts (touch/battery/modem — each written by its own
+# rcS script), then write `done ok|fail`. `done` gates the boot-verdict
+# consumers (agboot-ok slot marking, suites); since the boot story (ring →
+# answer) starts at panel-light with the net still in flight, `done` no
+# longer waits for Wi-Fi. Only a LOCAL key failure (no netdev, or a
+# touch/battery/modem fail line) is a broken boot.
+#
+# Phase 2, the NET chain — never `done fail`: join /etc/wifi.conf with our
+# own supplicant (aginx-net-join, 原名 wifi-join: scan -> assoc -> WPA2-PSK
+# 4-way handshake -> key install, M4), get a lease with udhcpc
+# (default.script applies it and writes /etc/resolv.conf), then prove
+# DNS + TCP + HTTP by fetching http://www.baidu.com with /bin/httpget,
+# then the bounded ntpd clock sync. Any net failure writes its fail line
+# and exits 0: the voice daemon's boot scene reads wifi/dhcp fail for the
+# lost-hardline path (对准配对码), provision exits early on them, and
+# net-watch self-heals the link in service.
+# Every milestone lands in /run/boot.state:
+#   wlan fail "no netdev"   (the ok line belongs to radio-bringup)
+#   wifi run|ok|fail [ssid]
+#   dhcp run|ok|fail [ip]
+#   internet run|ok|fail [detail]
+#   time run|ok|fail [date]
+#   done ok|fail            <- phase 1 LOCAL verdict; never on net failure
+# /etc/wifi.conf is KEY=VALUE (ssid=/psk=) and lives on the device only —
+# the repo ships etc/wifi.conf.example; credentials never get committed.
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+LOG=/var/net.log
+exec >>"$LOG" 2>&1
+echo "=== net bring-up $(date) ==="
+
+STATE=/run/boot.state
+say() { echo "$1 $2 $3" >>"$STATE"; echo "net: $1 $2 $3"; }
+
+# ---- phase 1: local verdict (wlan0 + sibling bring-ups -> done) ---------
+# radio-bringup gets here eventually (modem PIL ~10 s, driver+FW after);
+# poll long enough that a slow boot is a late ok, not a false fail.
+n=0
+while [ ! -e /sys/class/net/wlan0 ] && [ $n -lt 240 ]; do
+  sleep 2; n=$((n+1))
+done
+if [ ! -e /sys/class/net/wlan0 ]; then
+  say wlan fail "no netdev"
+  say done fail
+  dmesg | grep -ai "icnss\|wlan" | tail -8
+  exit 1
+fi
+echo "wlan0 present after $((n*2))s $(date)"
+
+# The touch/battery/modem verdicts are written by their own rcS siblings;
+# wait for all three (bounded 480 s — every sibling script is bounded well
+# inside it, same budget as the wlan0 wait). A fail line among them is an
+# honest broken boot; running out the clock without three oks is too.
+LOCAL_OK=0
+n=0
+while [ $n -lt 240 ]; do
+  if grep -q '^touch ok' "$STATE" 2>/dev/null && \
+     grep -q '^battery ok' "$STATE" 2>/dev/null && \
+     grep -q '^modem ok' "$STATE" 2>/dev/null; then
+    LOCAL_OK=1
+    break
+  fi
+  # a fail line is final for that key — no point waiting for the rest
+  grep -qE '^(touch|battery|modem) fail' "$STATE" 2>/dev/null && break
+  sleep 2; n=$((n+1))
+done
+if [ "$LOCAL_OK" -ne 1 ]; then
+  say done fail "local bring-up"
+  exit 1
+fi
+say done ok
+echo "=== local verdict: done ok (net chain continues) $(date) ==="
+
+# ---- phase 2: net chain (never done fail) -------------------------------
+# Credentials. Missing config is a clean fail, not a guess — and not a
+# broken boot: no conf means unpaired, and pairing (voice 对准配对码 /
+# term 扫码配网) is the intended way in; provision retries next boot
+# (M27 discipline), net-watch may still heal once a conf appears.
+if [ ! -f /etc/wifi.conf ]; then
+  say wifi fail "no /etc/wifi.conf"
+  exit 0
+fi
+SSID=; PSK=
+while IFS='=' read -r k v; do
+  case "$k" in
+    ssid) SSID=$v ;;
+    psk)  PSK=$v ;;
+  esac
+done < /etc/wifi.conf
+# strip a trailing CR, in case the file was edited on a Windows host
+SSID=$(printf '%s' "$SSID" | tr -d '\r')
+PSK=$(printf '%s' "$PSK" | tr -d '\r')
+if [ -z "$SSID" ] || [ -z "$PSK" ]; then
+  say wifi fail "wifi.conf incomplete"
+  exit 0
+fi
+echo "joining ssid '$SSID' $(date)"
+
+# --- association + 4-way handshake + DHCP ------------------------------
+# Up to 2 attempts for the pair: a join that succeeds but DHCP that gets
+# no answer happened live (2026-08-28 recording session — AP busy for the
+# ~30 s udhcpc window); re-joining resets the link cleanly.
+say wifi run
+attempt=0
+IP=
+rc=1
+while [ $attempt -lt 2 ]; do
+  attempt=$((attempt+1))
+  echo "--- join attempt $attempt $(date)"
+  if AGINX_WIFI_PSK="$PSK" /usr/bin/aginx-net-join wlan0 "$SSID"; then
+    say wifi ok "$SSID"
+  else
+    jrc=$?
+    if [ $attempt -ge 2 ]; then
+      say wifi fail "join rc=$jrc"
+      exit 0
+    fi
+    say wifi run "retry"
+    continue
+  fi
+  say dhcp run
+  udhcpc -i wlan0 -n -q -t 10 -T 3 >/tmp/udhcpc.log 2>&1
+  rc=$?
+  [ $rc -eq 0 ] || tail -5 /tmp/udhcpc.log
+  IP=$(ip addr show wlan0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+  [ -n "$IP" ] && break
+  echo "attempt $attempt: dhcp rc=$rc — re-joining"
+  say wifi run "retry"
+done
+if [ -z "$IP" ]; then
+  say dhcp fail "rc=$rc"
+  exit 0
+fi
+say dhcp ok "$IP"
+echo "lease $IP applied $(date)"
+
+# --- internet: DNS + TCP + HTTP via www.baidu.com ------------------------
+# /bin/httpget, not busybox wget — this busybox's wget applet segfaults
+# (observed 2026-08-28, raw-IP URLs too; DNS via nslookup is fine).
+say internet run
+rm -f /tmp/baidu.html
+if HTTP=$(/bin/httpget http://www.baidu.com/ /tmp/baidu.html 2>&1); then
+  set -- $HTTP          # "HTTP <code> <n> bytes" — no awk: it segfaults here
+  BYTES=$3
+  echo "baidu fetch ok ($HTTP) $(date)"
+  say internet ok "www.baidu.com ${BYTES}B"
+  # Clock sync (M10 → #63) — TLS certificate validation needs a roughly
+  # correct clock, and this kernel boots at the build epoch (observed
+  # 1970/2029 drift). busybox date -s misparses GNU formats, so ntpd is
+  # the only trusted path. #63: the bounded retry (12 x alternating
+  # ntp.aliyun.com / cn.pool.ntp.org, gated on the wall clock landing in
+  # the present — date is the only verdict a 1970 boot clock can't fake)
+  # + the RTC-offset write now live in the image helper
+  # /usr/libexec/aginx/net-timesync — the single clock authority, shared
+  # with net-watch's steady-state heal. The old `rtcal sync` call here
+  # was a silent no-op every boot: RTC_SET_TIME -> EACCES, the pm8xxx
+  # driver denies Linux-side writes (2026-10-01 live receipt) — retired.
+  # Budget ~120 s stays inside provision's 180 s clock-gate wait — time
+  # ok|fail is phase 2's LAST line (#246: done already landed in phase 1;
+  # provision's pkg line still waits on internet ok + this verdict).
+  say time run
+  if /usr/libexec/aginx/net-timesync; then
+    say time ok "$(date +%Y-%m-%d)"
+    echo "clock synced: $(date)"
+  else
+    say time fail "ntpd"
+    echo "ntpd failed after bounded retry — TLS validation may break until the clock is fixed"
+  fi
+  echo "=== net up: $IP via $SSID $(date) ==="
+  exit 0
+fi
+say internet fail "$HTTP"
+echo "=== internet check failed: $HTTP $(date) ==="
+exit 0

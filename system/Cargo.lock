@@ -60,6 +60,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "aginx-api"
+version = "0.1.0"
+dependencies = [
+ "aginx-secret",
+ "agio",
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "testkit",
+ "thiserror 2.0.20",
+ "toml",
+ "ureq",
+ "urlencoding",
+ "zeroize",
+]
+
+[[package]]
 name = "aginx-call"
 version = "0.1.0"
 dependencies = [
@@ -122,6 +141,7 @@ dependencies = [
 name = "aginx-mem"
 version = "0.1.0"
 dependencies = [
+ "aginx-server",
  "anyhow",
  "carrier-lifecycle",
  "carrier-memory",
@@ -1026,6 +1046,7 @@ dependencies = [
  "cookie",
  "document-features",
  "idna",
+ "indexmap",
  "log",
  "publicsuffix",
  "serde",
@@ -5077,10 +5098,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "972d7902c8735f2695410b8aed7df6ed12a47394aa1c8d7af49f0497b731a94d"
 dependencies = [
  "base64 0.23.1",
+ "cookie_store",
  "log",
  "percent-encoding",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "ureq-proto",
  "utf8-zero",
  "webpki-roots 1.0.9",

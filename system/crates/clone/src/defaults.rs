@@ -1,6 +1,9 @@
 //! Default definition-layer content seeded into every new clone.
 //!
 //! Currently: the `self-growth` flow — the clone's factory-baked autonomous
+//! (P6: idle learn/draft only — **not** capability-face persist; see
+//! `capability-persist.toml` / SELF-EVOLUTION).
+//!
 //! learning/creation capability. Seeded by `clone_install_files` (kernel) when
 //! the clone doesn't ship its own `flows/self-growth/flow.md`.
 

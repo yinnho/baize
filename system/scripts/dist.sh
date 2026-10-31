@@ -227,4 +227,5 @@ echo "==> zip"
 
 ls -la "${ZIP}"
 echo "done: ${ZIP}"
-echo "publish: gh release create ${DEVICE}-v${VERSION} --repo yinnho/aginxos-next '${ZIP}' --title 'AginxOS ${DEVICE} ${VERSION}'"
+# Publish target: yinnho/baize (upstream of record since baize v0.0.1; not aginxos-next).
+echo "publish: gh release create ${DEVICE}-v${VERSION} --repo yinnho/baize '${ZIP}' --title 'AginxOS ${DEVICE} ${VERSION}'"

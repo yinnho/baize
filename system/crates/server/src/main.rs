@@ -13,10 +13,9 @@
 //   AGINX_HOME         home 根（workflows/ 的父），默认 ~/.aginx
 //   AGINX_DATA_DIR     网关数据根（agents/ 条目落处；缺席走 home 指针）
 
-mod gateway_registry;
-mod install;
-mod ops;
 
+use aginx_server::gateway_registry;
+use aginx_server::ops;
 use carrier_types::config::KernelConfig;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;

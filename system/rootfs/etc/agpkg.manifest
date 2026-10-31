@@ -68,7 +68,11 @@
 # digest 逐字符核过；镜像 /v0.6.2/ 服务器侧复验同值；v0.5.9 目录保留
 # 可回钉。
 
-aginxbrowser   https://pkgs.aginx.net/aginxbrowser/v0.6.2/aginxbrowser-0.6.2-aarch64-unknown-linux-musl-screenshot ef6a18bb7749a25f1e9fdb6a5b19e223242baa3ae35fbe446a3c175e5c1c6e23 opt
+# aginxbrowser v0.6.2 pin RETIRED 2026-10-31 — URL 404; asset parked at
+# aginxbrowser/v0.6.2.drifted-ef22563b/ (sha drift vs pin ef6a18bb).
+# Engine seat = diting (see OPT_ADD / public etc). Do not re-enable without
+# a live path + matching sha.
+# aginxbrowser   https://pkgs.aginx.net/aginxbrowser/v0.6.2/aginxbrowser-0.6.2-aarch64-unknown-linux-musl-screenshot ef6a18bb7749a25f1e9fdb6a5b19e223242baa3ae35fbe446a3c175e5c1c6e23 opt
 # python3 (M28) — first TREE bundle: musl CPython 3.12.14 (python-build-
 # standalone 20260901 install_only_stripped) + Alpine musl 1.2.5 ld.so;
 # pkg.toml exec faces /var/bin/python3 as a symlink into
@@ -82,7 +86,7 @@ codex          https://pkgs.aginx.net/codex/v0.151.0/codex-v0.151.0-aarch64-unkn
 # browser/search/fetch now run in-mother; names D13-re-cut below.)
 dup            https://pkgs.aginx.net/dup/v0.2.0/dup-v0.2.0-4pc.tar 652f9d583611826cdb3c5c02ee62a07b3e710df786c914f3a0e2629173c32a82 opt
 aginx-file     https://pkgs.aginx.net/aginx-file/v0.1.0/aginx-file-v0.1.0-4pc.tar f2318f15e2887fb463bc09a7231284583f106b732e7ecc2ca3333bd18099de2c opt
-aginx-mem      https://pkgs.aginx.net/aginx-mem/v0.2.0/aginx-mem-v0.2.0-4pc.tar 203a585b54964ccb160095c2cd16b25a008f9141a06458c3a234661baae5abe4 opt
+aginx-mem      https://pkgs.aginx.net/aginx-mem/v0.2.3/aginx-mem-v0.2.3-4pc.tar 700c48f950cba2512b69f1d27d09445cebb70f5f66cd69bcf653b9bc6fd8ed9a opt 0.2.3
 # grok is optional since M23 (选装 tier): an agent CLI like codex, but
 # self-built and not needed for the phone's own loop — pick it via "+".
 grok           https://pkgs.aginx.net/grok/v1.0.41/grok-v1.0.41-aarch64-unknown-linux-musl 7c0b8c973af6a78e2037f19ed93033471b8c5e722f9ff04b86b092e066e60d74 opt

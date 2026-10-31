@@ -526,16 +526,22 @@ if [ "${BOOT_STYLE}" != "vendor-boot" ]; then
   sed -i '' '/init\.d\/adbd/d' "${TREE}/etc/inittab"
 fi
 
-# /home 出厂整树（结构刀④）：真源=仓里 home/（docs/FS.md）——SOUL/
-# MEMORY、photos/files 空树占位、workflows/clone-creator 出厂助理。
-# 内嵌种子机制已退役（结构刀②③），镜像不带这棵树=裸 L0 首启无母体
-# 人格、无助理。「OTA 不覆盖 /home」只管升级通道——烤线是全新盘灌注，
-# 不受此限。
+# HOME-PHASE Seed (omacom borrow): the ONLY place that pours repo home/
+# onto a device tree. 真源=仓里 home/（docs/FS.md）——SOUL/MEMORY、
+# photos/files 空树、workflows/clone-creator 出厂助理。内嵌种子机制已退役；
+# 镜像不带这棵树=裸 L0 无母体人格。「OTA 不覆盖 /home」只管升级通道——
+# 烤线是全新盘灌注，不受此限。Resync of /home after rootfs swap is
+# state-restore (preserve), never this cp.
 cp -R "${ROOT}/home/." "${TREE}/home/"
 # 机型数据注入（D14）：bringup 脚本与 device.toml 都来自 devices/<codename>/。
 # bringup 内容 verbatim 搬运（211 行 mixer recipe 那种收据流不重排）；
 # device.toml 落 /etc/aginx/（hwd::load_or_exit 的读点——烤错档案=开机
 # fail-fast，正脸拒绝）。
+# PLATFORM-ROOT (omacom borrow / D14): machine facts are data files, not
+# crate branches. Bake-time source = devices/<codename>/; runtime root =
+# /etc/aginx/ (device.toml + groups.desc + secret.policy + svc.d + env).
+# Personality NEVER lands here — that is /home (HOME-PHASE Seed).
+# check.sh PLATFORM-ROOT gate reads these anchors.
 mkdir -p "${TREE}/etc/aginx"
 install -m 644 "${DEVDIR}/device.toml" "${TREE}/etc/aginx/device.toml"
 # armbian-ride（#66 W1）：切入脚本落树根 /init——目录骑乘后它就是卖家
@@ -560,10 +566,17 @@ if grep -qE '^\[panel\]' "${DEVDIR}/device.toml" \
    && ! grep -qE '^width *= *0$' "${DEVDIR}/device.toml"; then
   : > "${TREE}/etc/aginx/panel.on"
 fi
+# dirs (e.g. bare/ research) and *.md docs are not init scripts — skip.
+# Empty bringup/ still dies (found gate below).
+BRINGUP_FOUND=0
 for b in "${DEVDIR}"/bringup/*; do
-  test -f "${b}" || { echo "missing bringup scripts in ${DEVDIR}/bringup/" >&2; exit 1; }
+  [ -e "${b}" ] || continue
+  [ -f "${b}" ] || continue
+  case "$(basename "${b}")" in *.md) continue ;; esac
   install -m 755 "${b}" "${TREE}/etc/init.d/$(basename "${b}")"
+  BRINGUP_FOUND=1
 done
+[ "${BRINGUP_FOUND}" = "1" ]   || { echo "missing bringup scripts in ${DEVDIR}/bringup/" >&2; exit 1; }
 # 首启 root-fs 扩容件（#318，L0 缺口刀1）：rcS 同步跑 disk-grow（上面的
 # bringup 件），它要 resize2fs。落 /usr/bin——镜像 usr 下只有 bin/libexec/
 # share 一个工具目录的惯例位（usr/sbin 不存在，别开新目录）。
@@ -592,7 +605,9 @@ OPT_LAYER_A="aginx aginx-gateway aginx-secretd aginx-asr aginx-tts aginx-voice a
 # Layer B — frozen human-face (available; not default narrative)
 OPT_LAYER_B="aginx-term aginx-ocr aginx-qr aginx-pair"
 for p in ${OPT_LAYER_A} ${OPT_LAYER_B}; do
-  R="pkgs/${p}"
+  # baize local-pkgs overlay wins over pkgs/ (baize-owned recipe snapshot; not a next bridge)
+  if [ -f "local-pkgs/${p}/pkg.toml" ]; then R="local-pkgs/${p}"
+  else R="pkgs/${p}"; fi
   p_ver="$(sed -n 's/^version *= *"\([^"]*\)"/\1/p' "${R}/pkg.toml" | sed -n '1p')"
   p_url="$(sed -n 's/^url *= *"\([^"]*\)"/\1/p' "${R}/pkg.toml" | sed -n '1p')"
   p_dep="$(sed -n 's/^depends *= *"\([^"]*\)"/\1/p' "${R}/pkg.toml" | sed -n '1p')"
@@ -642,6 +657,15 @@ echo "${STAMP}" > "${TREE}/etc/aginx-version"
 # term 不烤也不拉（#427：rcS 的 aginx-term-handoff 已删——#422 黑匣子
 # 裁决后镜像不生成任何人脸，term 包纯目录死件）。批③ (09-10): wizard
 # 出烤——装机流程是扫码/语音，wizard 无入口。
+# #472 运维件归包：镜像上的 aginx-pkg 必须能 apply_cron，否则 morning-report /
+# aginx-mem 等 [cron] 包装上了不定时（redfin 2026-10-31 债：10-27 二进制无
+# aginx:cron= 标记，热换后才落块）。烤盘硬门——缺则 die，禁止回退到无 cron 件。
+[ -x "${TARGET}/aginx-pkg" ] \
+  || { echo "FATAL: missing ${TARGET}/aginx-pkg — zigbuild L0 五件未产出" >&2; exit 1; }
+if ! strings "${TARGET}/aginx-pkg" | grep -q 'aginx:cron='; then
+  echo "FATAL: ${TARGET}/aginx-pkg lacks apply_cron (no aginx:cron= string) — rebuild crates/pkg before bake" >&2
+  exit 1
+fi
 install -m 755 "${TARGET}/aginx-pkg" "${TREE}/usr/bin/"
 install -m 755 "${TARGET}/aginx-svc" "${TREE}/usr/bin/"
 # boot-ok 是 redfin ABL 的 GPT slot-retry 写手；raw-boot 不烤（未探针的

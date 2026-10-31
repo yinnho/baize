@@ -7,6 +7,10 @@ repository.workspace = true
 authors.workspace = true
 description = "the front desk: UDS face (list/status/install/remove) + system gateway entry (engine commoditized, knife 4-4)"
 
+[lib]
+name = "aginx_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "aginx-server"
 path = "src/main.rs"

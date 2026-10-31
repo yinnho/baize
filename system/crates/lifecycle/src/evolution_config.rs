@@ -2,6 +2,12 @@
 //!
 //! Reads `EVOLUTION.md` from the clone's workspace root. When missing,
 //! uses conservative defaults.
+//!
+//! # P6 cut (`self_growth` ≠ capability persist)
+//! `self_growth_enabled` is idle learn/draft only. Capability-face growth uses
+//! `capability-persist.toml` / `capability_*` tools. Opening self-growth must
+//! never open capability persist. `capability_persist_enabled` in EVOLUTION.md
+//! is face-level opt-in and still requires the home gate.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -45,11 +51,19 @@ pub struct EvolutionConfig {
     /// Whether autonomous self-growth (idle-time learn/create cron) is enabled
     /// for this clone. Requires the global master switch (`clone_lifecycle
     /// .self_growth_enabled`) to be on too. Default off.
+    ///
+    /// **P6：非能力面生长**。本键只管 idle 学/写稿；能力固化走
+    /// `capability-persist.toml` / `capability_*` 工具，互不暗开。
     pub self_growth_enabled: bool,
     /// Self-growth cron interval in hours — how often the clone wakes to
     /// autonomously learn (and, if OA-bound, create article drafts). Default 6.
     pub self_growth_interval_hours: u64,
+    /// Face-level capability-persist opt-in (EVOLUTION.md). Default **false**.
+    /// Even when true, the home `capability-persist.toml` / env gate must also
+    /// be on — this key alone never opens L0–L3 persist (P6 cut).
+    pub capability_persist_enabled: bool,
     /// V3: identity layer files that are frozen — evolution system may not modify.
+    /// Evolve 一班不得借本轨扩权改 `flows/`（SELF-EVOLUTION §七）；白名单扩容另案。
     pub identity_frozen_files: Vec<String>,
 }
 
@@ -66,6 +80,7 @@ impl Default for EvolutionConfig {
             feedback_to_hub: false,
             self_growth_enabled: false,
             self_growth_interval_hours: 6,
+            capability_persist_enabled: false,
             identity_frozen_files: Vec::new(),
         }
     }
@@ -138,6 +153,9 @@ fn parse_evolution_config(content: &str) -> EvolutionConfig {
             if let Ok(n) = val.trim().parse() {
                 config.self_growth_interval_hours = n;
             }
+        } else if let Some(val) = line.strip_prefix("capability_persist_enabled:") {
+            // Face-level opt-in only; never inferred from self_growth_enabled.
+            config.capability_persist_enabled = val.trim() == "true";
         } else if let Some(val) = line.strip_prefix("identity_frozen:") {
             let v = val.trim().trim_matches('"').trim_matches('\'');
             config.identity_frozen_files = v
@@ -257,5 +275,23 @@ max_knowledge_files: 50
         let config = read_evolution_config(tmp.path());
         assert_eq!(config.evolution_mode, EvolutionMode::Moderate);
         assert_eq!(config.max_knowledge_files, 50);
+    }
+
+    #[test]
+    fn test_capability_persist_defaults_off_and_independent_of_self_growth() {
+        let config = parse_evolution_config(
+            "---\nevolution_mode: moderate\nself_growth_enabled: true\n---\n",
+        );
+        assert!(config.self_growth_enabled);
+        assert!(
+            !config.capability_persist_enabled,
+            "self_growth must not dark-open capability_persist"
+        );
+
+        let config = parse_evolution_config(
+            "---\ncapability_persist_enabled: true\nself_growth_enabled: false\n---\n",
+        );
+        assert!(config.capability_persist_enabled);
+        assert!(!config.self_growth_enabled);
     }
 }

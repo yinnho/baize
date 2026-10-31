@@ -724,6 +724,10 @@ impl Default for BorrowPolicyConfig {
 }
 
 /// Clone lifecycle configuration — controls post-conversation learning and knowledge evolution.
+///
+/// **P6 切割**：`self_growth_enabled` = idle 学/写稿（非能力面生长）。能力固化总闸是
+/// `/home/capability-persist.toml`（及可选面级同名文件）的 `enabled`，**不要**用本字段
+/// 打开 `capability_propose` / L2/L3 落盘。两闸默认都关、互不暗开。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CloneLifecycleConfig {
@@ -735,7 +739,16 @@ pub struct CloneLifecycleConfig {
     /// cron). When false, no clone runs self-growth regardless of its EVOLUTION.md.
     /// When true, a clone runs self-growth only if its EVOLUTION.md also sets
     /// `self_growth_enabled: true`. Default off.
+    ///
+    /// **非能力面生长**（SELF-EVOLUTION P6）：开本键 ≠ 开能力固化。
     pub self_growth_enabled: bool,
+    /// Mirror / documentation of the capability-persist master intent at config
+    /// layer. Default **false**. Runtime enforcement is file-based
+    /// (`capability-persist.toml` + env `CAPABILITY_PERSIST_ENABLED`); this
+    /// field must not be read as a substitute for that gate, and must never be
+    /// inferred from `self_growth_enabled`.
+    #[serde(default)]
+    pub capability_persist_enabled: bool,
 }
 
 impl Default for CloneLifecycleConfig {
@@ -743,6 +756,7 @@ impl Default for CloneLifecycleConfig {
         Self {
             evolution_enabled: true,
             self_growth_enabled: false,
+            capability_persist_enabled: false,
         }
     }
 }

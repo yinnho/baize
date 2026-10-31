@@ -1,0 +1,49 @@
+# aginx-gateway — 对外面守护的包形态（v0.2.0 换真身，2026-09-27 刀1）。
+# v0.2.2（2026-10-25 部署窗）：安全三刀+token hash 化全量上机（生态仓
+# 350595b）——刀A PseudoBound/认领制 device_secret/刀B local_clients/
+# 刀C TLS+fail-closed+4MB、85685cc auth/binding 落盘只存 hash（存量明
+# 文加载自动折算迁移）。relay 腿换 [relay] device_secret（v2 认领制；
+# relay_secret 旧形兼容读）。
+# v0.2.1（2026-10-25）：安全面 P1-P3 上机（生态仓 4d69574）——principal
+# 贯通+名册 [access] ACL+台账 caller。装机侧随配：敏感注册项
+# （system/claude/codex）设备侧 aginx.toml 加 [access]
+# principals=["owner","relay"]；频道桥/包装 cron 目标（无 [access]）缺省
+# 全放行不受阻。X2 owner 运维腿=relay principal，不在门外。
+# 裁决：aginx/agc/aginxbrowser/aginxbrain 四项目独立专人开发，本仓只
+# 装配不仿制——v0.1.x 的 crates/gateway 仿制品退役（刀4 删源）。真身=
+# 生态仓 ~/Documents/aginx/aginx（HEAD 5658af7）cargo zigbuild 的
+# aarch64-musl 静态，bin 改名落 pkgfiles：单元直指真身 spawn；exec 面
+# /var/bin/aginx-gateway symlink（安装器自动生成 .aginxmd）。
+# 权限模型（v0.1.x 全缺，真品自带）：access=private 默认不对外；主人=
+# pair 出码 → agc --bind 入钥匙串；第三方=auth 发 scoped token
+# （allowed_agents 点名）。裸根结构性不可 prompt（agent 参数必填）。
+# 配置落位两坑（生态源码定案）：
+#   ① 必须是 /etc/aginx/config.toml——CLI 子命令（pair/auth）不认 -c，
+#     走 find_default_config 四级候选（./aginx.toml → ./.aginx/config.toml
+#     → ~/.aginx/config.toml → /etc/aginx/config.toml），守护与 CLI 要
+#     同一份文件；运维面调用须带 AGINX_DATA_DIR=/var/lib/aginx/gateway。
+#   ② 无 agent 拒启：has_agents() 空则交互式 setup（stdin EOF→跳过）→
+#     exit(1)→5 连崩断路器。首启前必须先铺 ≥1 个
+#     $AGINX_DATA_DIR/agents/<名>/aginx.toml（刀3 codex 条目先行）。
+# relay 注册握手 = {id, token: relay_secret}——relay_secret 从旧 env 的
+# AGINX_RELAY_SECRET 搬入，先写配置再装本包（缺 id 裸 exit(1) 同断路器）。
+# 状态归 N5 世界：AGINX_DATA_DIR=/var/lib/aginx/gateway（绑定台账、
+# 丢件柜台、agents 注册表）。切流纪律：relay id 唯一注册方——先停旧
+# 网关再起本包（docs/PLAN-真aginx入机.md 刀2）。
+# depends=aginx-secretd 只保安装序；启动序由 requires_weak 延到 secretd
+# ready（弱依赖，secretd 后死不拖累）。
+name = "aginx-gateway"
+version = "0.2.3"
+summary = "对外面守护（真 aginx）：8443 relay 长连、private 默认不对外、pair/auth 凭据面"
+group = "net"
+depends = "aginx-secretd"
+url = "https://pkgs.aginx.net/aginx-gateway/v0.2.3/aginx-gateway-v0.2.3-4pc.tar"
+exec = "bin/aginx-gateway"
+
+[service]
+cmd = "/var/lib/aginx/pkgfiles/aginx-gateway/bin/aginx-gateway"
+args = ["-c", "/etc/aginx/config.toml"]
+type = "simple"
+envs = ["AGINX_DATA_DIR=/var/lib/aginx/gateway"]
+env_file = "/etc/aginx/env"
+requires_weak = ["aginx-secretd"]

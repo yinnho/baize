@@ -1,5 +1,7 @@
 # devices/ — 机型是数据（D14）
 
+> **PLATFORM-ROOT 契约**：仓内真源=`devices/<codename>/`；运行时平台根=`/etc/aginx/`（`device.toml` 等）。人格/记忆只在 `/home`——形状文见仓根 `docs/PLATFORM-ROOT.md`；门在 `scripts/check.sh`。
+
 平台（`crates/` + `rootfs/` 通用配方 + `scripts/` 通用入口）对具体机型零引用。
 一切机型差异住 `devices/<codename>/`，烤机时 `DEVICE=<codename>
 ./scripts/build-rootfs.sh` 选择注入。**加一台机 = 新目录 + 一条 bring-up

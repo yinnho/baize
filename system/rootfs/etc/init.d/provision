@@ -1,41 +1,34 @@
 #!/bin/sh
-# Provision (v2, M27 agpkg→N4 aginx-pkg; docs: SYSTEM.md §9 line): three
-# explicit layers, all idempotent, none of which ever blocks the boot.
+# Provision (v2, M27 agpkg→N4 aginx-pkg): runtime layers for /var/lib/aginx
+# + pkg faces. All idempotent; none ever blocks the boot.
 #
-#   seed      — scaffold the state tree /var/lib/aginx (N5③). Pure
-#               mkdir, no markers: a wiped or partial tree just gets
-#               re-created next boot. (The baked image scaffolds these
-#               too — M26 made them state-tar members, and busybox tar
-#               exits 1 on a missing member. Seed is the runtime half
-#               of that belt-and-braces.)
-#   resync    — aginx-pkg sync EVERY boot (first install and self-heal are
-#               one path: an entry whose installed sha256 differs gets
-#               re-downloaded atomically). Output goes to a log, not
-#               boot.state — the boot line only records ok/fail.
-#               Any unit whose binary THIS boot installed
-#               gets `aginx-svc restart` — the supervisor restart-
-#               exhausted it during the empty-/var/bin window of earlier
-#               boots (observed 2026-09-03 on the old line: 5 restarts
-#               -> failed, manual revive).
-#   repair    — #472①: a capture re-flash keeps /var/lib (ledger: stamps,
-#               units, skills, pkgfiles trees) but wipes /var/bin — every
-#               face gone while the ledger says installed, and the all-opt
-#               manifest makes sync's core self-heal a no-op. Local leg
-#               (every boot, offline, never blocks): rebuild tree faces +
-#               heal missing sidecars/units from the persisted pkg.toml.
-#               Net leg (only when pending): binary packages re-fetch
-#               from the device's own manifest (which rides the state
-#               tar) behind the internet + time gates.
-#   finalize  — one-shot steps, gated by `aginx-done` markers in
-#               /var/lib/aginx/done: run only while unmarked, mark only on
-#               success, so a failed step retries next boot and a wiped
-#               marker (state-tar loss) means a clean re-run. First
-#               real tenant is M28 (python + pip). Structure here now.
+# Boot order (anchors below; check.sh HOME-PHASE gate reads them):
+#   seed      — scaffold /var/lib/aginx/{done,skills,units,stamps}. Pure
+#               mkdir; wiped trees re-create next boot. (Bake also scaffolds
+#               — M26 state-tar members; Seed is the runtime belt-and-braces.)
+#   repair    — #472① local every boot (offline): rebuild tree faces / heal
+#               sidecars from persisted pkg.toml when /var/bin was wiped but
+#               the ledger stayed. Net leg later when pending + internet.
+#   resync    — aginx-pkg sync when core entries exist (all-opt L0 skips).
+#               First install and self-heal are one path; units whose binary
+#               landed this boot get `aginx-svc restart`.
+#   finalize  — one-shot steps behind `aginx-done` (/var/lib/aginx/done):
+#               run while unmarked, mark only on success. First tenant M28
+#               (python loader + pip). Trust the artifact, not the mark.
 #
-# net-bringup writes the net lines (wifi/dhcp/internet ok|fail) and — since
-# the 开机剧情 #246 phase split — the phase-1 LOCAL verdict "done ok|fail";
-# net failures never write done fail (they are the lost-hardline story, not
-# a broken boot). This script writes ONLY the pkg lines.
+# HOME three-phase (omacom Seed→Finalize→Resync borrow; agent black-box):
+#   HOME-PHASE Seed:     bake only — build-rootfs `cp -R home/.` onto a fresh
+#                        image. Never this script. Never OTA image overlay.
+#   HOME-PHASE Finalize: dynamic first-boot that needs live state (pair /
+#                        wizard / opt-in) — NOT silent skel copy. This script
+#                        must not write under /home/ (gate in check.sh).
+#   HOME-PHASE Resync:   preserve via state-restore after rootfs swap
+#                        (/home rides STATE_TAR_MEMBERS). Destructive
+#                        "clobber /home back to factory seed" is NOT a boot
+#                        path — would need an explicit future tool + GO=1.
+#
+# net-bringup writes wifi/dhcp/internet (+ phase-1 local "done"); net
+# failures never write done fail. This script writes ONLY the pkg lines.
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/var/bin
 
 STATE=/run/boot.state

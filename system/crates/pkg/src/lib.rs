@@ -4,8 +4,10 @@
 //! musl binary at /var/bin/<name> with /var/bin/.<name>.prev for
 //! rollback and /var/apps/<name>/ as its data dir; manifest lines are
 //! `<name> <url> <sha256> [core|opt] [version] [deps]` with absent 4th
-//! field = core, an absent 5th field = no version (display-only — sha256
-//! equality stays the only truth), and an optional 6th comma-separated
+//! field = core, an absent 5th field = no version (sha256 equality is still
+//! the up-to-date truth; when BOTH sides carry a version, install refuses
+//! downgrades — channel only moves forward; `AGINX_PKG_ALLOW_DOWNGRADE=1`
+//! is the explicit recovery bypass), and an optional 6th comma-separated
 //! dep list (sync installs deps first); `sync` self-heals core entries
 //! only; `opt-in` installs an opt entry WITH its transitive deps (deps
 //! first, any tier — only the named entry gets a launcher seed) and
@@ -139,8 +141,8 @@ pub struct Entry {
     pub url: String,
     pub sha256: String,
     pub tier: Tier,
-    /// 5th manifest column, display-only (sha256 equality stays the
-    /// only truth — version never gates an install decision).
+    /// 5th manifest column (sha256 equality stays the up-to-date truth;
+    /// version additionally refuses downgrades when both sides set it).
     pub version: Option<String>,
     /// 6th manifest column, comma-separated package names this one
     /// needs installed first (sync installs deps before dependents).
@@ -507,11 +509,14 @@ fn install_bundle(p: &Paths, name: &str, src: &Path) -> Result<Kind, Fail> {
 
     // Display metadata (#284 lockstep fix): summary/args/examples/group
     // feed the face's .aginxmd sidecar (the router meta protocol reads
-    // exactly those keys); version feeds the version stamp. All optional
-    // and display-only. NOTE: version itself does NOT go into the
-    // sidecar — the router's parser rejects unknown keys, and sha256
-    // stays the only truth anyway.
+    // exactly those keys); version feeds the version stamp AND the
+    // forward-only gate below. version itself does NOT go into the
+    // sidecar — the router's parser rejects unknown keys. sha256 stays
+    // the up-to-date truth; version only refuses going backwards.
     let meta = parse_pkg_meta(tbl)?;
+    if let Some(v) = &meta.version {
+        refuse_downgrade(p, name, v)?;
+    }
 
     // The face: either a flat binary member (bin/<name>) or a symlink
     // into the files/ tree (pkg.toml exec). Exactly one.
@@ -874,7 +879,7 @@ fn read_stamp(p: &Paths, name: &str) -> Option<String> {
 /// this for compiled binaries (router meta::read_for → sidecar_for).
 /// ONLY router-known keys (summary/args/examples/group): `version`
 /// must not ride here (the router's parser rejects unknown keys), it
-/// goes to the version stamp; sha256 stays the only truth either way.
+/// goes to the version stamp; sha256 stays the up-to-date truth either way.
 fn write_face_sidecar(p: &Paths, name: &str, meta: &PkgMeta) -> Result<(), Fail> {
     let mut body = String::new();
     if let Some(s) = &meta.summary {
@@ -895,6 +900,85 @@ fn write_face_sidecar(p: &Paths, name: &str, meta: &PkgMeta) -> Result<(), Fail>
     let dst = p.bindir.join(format!("{name}.aginxmd"));
     write_644(&dst, body.as_bytes())
         .map_err(|e| io_fail("sidecar_write", format!("{}: {e}", dst.display())))
+}
+
+/// Compare dotted version strings (`0.2.3`, `0.2.10`, optional `-`
+/// pre-release segments). Numeric segments compare numerically;
+/// non-numeric as strings; a missing trailing numeric `0` is equal
+/// (`1.0` == `1.0.0`). Used only for the forward-only gate — not for
+/// "up to date" (sha256 still owns that).
+fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn parts(s: &str) -> Vec<Result<u64, &str>> {
+        s.split(|c| c == '.' || c == '-')
+            .filter(|p| !p.is_empty())
+            .map(|p| p.parse::<u64>().map_err(|_| p))
+            .collect()
+    }
+    let pa = parts(a);
+    let pb = parts(b);
+    let n = pa.len().max(pb.len());
+    for i in 0..n {
+        let aa = pa.get(i);
+        let bb = pb.get(i);
+        match (aa, bb) {
+            (None, None) => break,
+            (None, Some(Ok(0))) | (Some(Ok(0)), None) => {}
+            // longer numeric patch beats shorter (`1.0` < `1.0.1`)
+            (None, Some(Ok(_))) => return Ordering::Less,
+            (Some(Ok(_)), None) => return Ordering::Greater,
+            // trailing pre-release text is older than the bare release
+            // (`1.0-rc` < `1.0`); same when both sides have text at depth
+            (None, Some(Err(_))) => return Ordering::Greater,
+            (Some(Err(_)), None) => return Ordering::Less,
+            (Some(Ok(x)), Some(Ok(y))) => {
+                if x != y {
+                    return x.cmp(y);
+                }
+            }
+            (Some(Err(x)), Some(Err(y))) => {
+                if x != y {
+                    return (*x).cmp(*y);
+                }
+            }
+            // numeric sorts after text at the same depth so `1.0-rc` < `1.0.0`
+            // when the third segment is `rc` vs `0` — already covered above
+            // for missing; for both present:
+            (Some(Ok(_)), Some(Err(_))) => return Ordering::Greater,
+            (Some(Err(_)), Some(Ok(_))) => return Ordering::Less,
+        }
+    }
+    Ordering::Equal
+}
+
+/// Channel-only-forward: refuse installing a package whose pkg.toml
+/// version is older than the on-device `<name>.version` stamp.
+/// First install (no stamp) and equal/newer versions pass. Bypass:
+/// `AGINX_PKG_ALLOW_DOWNGRADE=1` (recovery / explicit channel roll-back —
+/// distinct from `aginx-pkg rollback`, which restores the single `.prev`
+/// face).
+fn refuse_downgrade(p: &Paths, name: &str, incoming: &str) -> Result<(), Fail> {
+    if std::env::var_os("AGINX_PKG_ALLOW_DOWNGRADE").is_some() {
+        return Ok(());
+    }
+    let Some(cur) = read_version(p, name) else {
+        return Ok(());
+    };
+    if cmp_version(incoming, &cur) == std::cmp::Ordering::Less {
+        return Err(
+            Fail::new(
+                ErrorType::Usage,
+                "pkg_downgrade",
+                format!(
+                    "refusing downgrade of {name}: incoming {incoming} < installed {cur}"
+                ),
+            )
+            .with_hint(
+                "channel-only-forward: install a newer (or equal) version, or set AGINX_PKG_ALLOW_DOWNGRADE=1 for recovery",
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// Version stamp, next to the sha stamp (the body format of the sha
@@ -2114,6 +2198,59 @@ mod tests {
         p.manifest = write_signed(&root, "m4", &format!("x http://x/{dsha} {dsha} opt 1.0 y\ny http://x/{dsha} {dsha} opt 1.0 x\n"), &sk);
         let f = cmd_opt_in(&p, "x", &pub_b64).unwrap_err();
         assert_eq!(f.code, "pkg_dep_cycle");
+    }
+
+    #[test]
+    fn cmp_version_numeric_and_equal_padding() {
+        use std::cmp::Ordering;
+        assert_eq!(cmp_version("0.2.3", "0.2.6"), Ordering::Less);
+        assert_eq!(cmp_version("0.2.6", "0.2.3"), Ordering::Greater);
+        assert_eq!(cmp_version("0.2.3", "0.2.3"), Ordering::Equal);
+        assert_eq!(cmp_version("1.0", "1.0.0"), Ordering::Equal);
+        assert_eq!(cmp_version("0.2.10", "0.2.9"), Ordering::Greater);
+        assert_eq!(cmp_version("1.0-rc", "1.0"), Ordering::Less);
+    }
+
+    #[test]
+    fn install_refuses_version_downgrade_unless_bypassed() {
+        let root = tmp("fwd");
+        let p = paths(&root);
+        let bin = b"#!/bin/sh\necho ok\n";
+        let toml_new = b"name = \"dup\"\nversion = \"0.2.6\"\n";
+        let toml_old = b"name = \"dup\"\nversion = \"0.2.3\"\n";
+        let skill = b"# skill\n";
+        let tar_new = root.join("new.tar");
+        let tar_old = root.join("old.tar");
+        build_tar(&tar_new, &[("bin/dup", bin), ("pkg.toml", toml_new), ("SKILL.md", skill)]);
+        build_tar(&tar_old, &[("bin/dup", bin), ("pkg.toml", toml_old), ("SKILL.md", skill)]);
+        let sha_new = sha256_file(&tar_new).unwrap();
+        let sha_old = sha256_file(&tar_old).unwrap();
+        install_file(&p, "dup", &tar_new, &sha_new).unwrap();
+        assert_eq!(read_version(&p, "dup").as_deref(), Some("0.2.6"));
+        // negative: older version refused
+        let f = install_file(&p, "dup", &tar_old, &sha_old).unwrap_err();
+        assert_eq!(f.code, "pkg_downgrade");
+        assert_eq!(read_version(&p, "dup").as_deref(), Some("0.2.6"), "stamp unchanged on refuse");
+        // positive: equal version (different sha) allowed
+        let toml_eq = b"name = \"dup\"\nversion = \"0.2.6\"\n";
+        let tar_eq = root.join("eq.tar");
+        let bin2 = b"#!/bin/sh\necho eq\n";
+        build_tar(&tar_eq, &[("bin/dup", bin2), ("pkg.toml", toml_eq), ("SKILL.md", skill)]);
+        let sha_eq = sha256_file(&tar_eq).unwrap();
+        install_file(&p, "dup", &tar_eq, &sha_eq).unwrap();
+        assert_eq!(read_version(&p, "dup").as_deref(), Some("0.2.6"));
+        // positive: newer allowed
+        let toml_neu = b"name = \"dup\"\nversion = \"0.2.7\"\n";
+        let tar_neu = root.join("neu.tar");
+        build_tar(&tar_neu, &[("bin/dup", bin), ("pkg.toml", toml_neu), ("SKILL.md", skill)]);
+        let sha_neu = sha256_file(&tar_neu).unwrap();
+        install_file(&p, "dup", &tar_neu, &sha_neu).unwrap();
+        assert_eq!(read_version(&p, "dup").as_deref(), Some("0.2.7"));
+        // positive bypass: explicit downgrade
+        std::env::set_var("AGINX_PKG_ALLOW_DOWNGRADE", "1");
+        install_file(&p, "dup", &tar_old, &sha_old).unwrap();
+        std::env::remove_var("AGINX_PKG_ALLOW_DOWNGRADE");
+        assert_eq!(read_version(&p, "dup").as_deref(), Some("0.2.3"));
     }
 
     #[test]

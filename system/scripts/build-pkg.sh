@@ -59,6 +59,9 @@
 #                         标记器（crates/svc）+ 等 done ok wrapper，
 #                         oneshot_async 单元；enchilada 首用户（redfin
 #                         走烤内 rcS 路径不装，无 A/B 的板不装）
+#   D17 api 腿  aginx-api
+#                       — crates/api 双件（aginx-api + mp-material-upload）；
+#                         配方 local-pkgs/（不进封仓 pkgs）；无守护
 #
 # 产物 out/pkgs/<name>-v<ver>-4pc.tar + .sha256（裸 hex），尾行打一行
 # manifest 片段（name url sha opt version [deps]）——L0 清单组装（刀4）
@@ -89,8 +92,15 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-RECIPE="pkgs/${PKG}"
-[ -f "${RECIPE}/pkg.toml" ] || { echo "FATAL: no recipe ${RECIPE}/pkg.toml" >&2; exit 1; }
+# 配方查找：local-pkgs/（baize 特供 overlay）优先于 pkgs/（baize 自有配方快照；非封仓桥）
+if [ -f "local-pkgs/${PKG}/pkg.toml" ]; then
+  RECIPE="local-pkgs/${PKG}"
+elif [ -f "pkgs/${PKG}/pkg.toml" ]; then
+  RECIPE="pkgs/${PKG}"
+else
+  echo "FATAL: no recipe local-pkgs/${PKG}/pkg.toml or pkgs/${PKG}/pkg.toml" >&2
+  exit 1
+fi
 [ -f "${RECIPE}/SKILL.md" ] || { echo "FATAL: no ${RECIPE}/SKILL.md（四件套铁律）" >&2; exit 1; }
 
 # pkg.toml 是自家扁平格式，值全带引号无内嵌引号——sed 取串够用
@@ -680,8 +690,24 @@ case "${PKG}" in
       || { echo "FATAL: aginx-boot-ok 非 musl 静态（$(file "${STAGE}/files/bin/aginx-boot-ok")）" >&2; exit 1; }
     MEMBERS="pkg.toml SKILL.md files"
     ;;
+  aginx-api)
+    # D17 api 腿（2026-10-30 P1）：crates/api 双 bin → files/bin/；
+    # exec=bin/aginx-api 铸主脸；aginx-mp-material-upload 同树，
+    # --push 后置第二脸软链（ffmpeg/ffprobe 同形缺口）。
+    echo "==> zigbuild aginx-api（musl 双件，缓存则秒过）"
+    (cd "${ROOT}" && cargo zigbuild --release --target aarch64-unknown-linux-musl -p aginx-api)
+    mkdir -p "${STAGE}/files/bin"
+    install -m 755 "${TARGET_DIR}/aginx-api" "${STAGE}/files/bin/aginx-api"
+    install -m 755 "${TARGET_DIR}/aginx-mp-material-upload" \
+      "${STAGE}/files/bin/aginx-mp-material-upload"
+    for b in aginx-api aginx-mp-material-upload; do
+      file "${STAGE}/files/bin/${b}" | grep -q "statically linked" \
+        || { echo "FATAL: ${b} 非 musl 静态（$(file "${STAGE}/files/bin/${b}")）" >&2; exit 1; }
+    done
+    MEMBERS="pkg.toml SKILL.md files"
+    ;;
   *)
-    echo "FATAL: 未知包名 ${PKG}（两裸包/换芯树包/两树包/工具双包/三树包/刀F三包 zigbuild / 上游树包 git / sqlite3 / aginx-proxy / 频道两包 / aginxresearch / morning-report / aginx-fg / aginx-boot-ok）" >&2
+    echo "FATAL: 未知包名 ${PKG}（… / aginx-api / aginx-boot-ok …）" >&2
     exit 1
     ;;
 esac
@@ -727,4 +753,21 @@ if [ -n "${SERIAL}" ]; then
   echo "==> push ${SERIAL}（dev 免签通道）"
   adb -s "${SERIAL}" push "${OUT}/${TARNAME}" "/data/local/tmp/${TARNAME}"
   adb -s "${SERIAL}" shell "/usr/bin/aginx-pkg install ${PKG} /data/local/tmp/${TARNAME} ${SHA}"
+  # aginx-api：第二脸（material-upload）——安装器 exec 只铸一条，手补软链+sidecar
+  if [ "${PKG}" = "aginx-api" ]; then
+    echo "==> place sibling face aginx-mp-material-upload"
+    adb -s "${SERIAL}" shell 'set -e
+      PKGFILES=/var/lib/aginx/pkgfiles/aginx-api/bin
+      ln -sfn ../lib/aginx/pkgfiles/aginx-api/bin/aginx-mp-material-upload /var/bin/aginx-mp-material-upload
+      cat > /var/bin/aginx-mp-material-upload.aginxmd << "SIDE"
+# aginx:summary=weixin-oa multipart cover upload → media_id (aginx-api sibling)
+# aginx:args=--account <id> [--type image] <file>
+# aginx:examples=--account primary /tmp/cover.jpg
+# aginx:group=api
+SIDE
+      test -x "$PKGFILES/aginx-api"
+      test -x "$PKGFILES/aginx-mp-material-upload"
+      ls -la /var/bin/aginx-api /var/bin/aginx-mp-material-upload
+    '
+  fi
 fi

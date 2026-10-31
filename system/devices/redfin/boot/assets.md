@@ -7,6 +7,17 @@ regenerate it. The first-gen repo (`~/Documents/aginxos`, sealed 2026-09-08
 at baseline `0534ea8` + seal commit) stays readable: sealing means "no
 further evolution", not "cannot run" — its build scripts still execute.
 
+## baize 本机资产面（2026-10-31）
+
+`baize/system/.local` 是**自有副本**（约 285M 必要子集），不再符号链接到
+aginxos-next。pack 产出写在
+`system/.local/device/redfin/boot-out/`，与封仓 `.local`  inode 分离。
+
+含：keys、boot-tools、serials.env、vendor-ramdisk-root、trampoline、stock、
+initramfs、radio、dropbear、qmi-headers、boot-out/props-min、assets/cacert。
+有意不含：backups、kernel-src、voice/ocr 大树、modem 实验收据。详见
+`system/.local/README.md`。
+
 ## Layout
 
 ```text

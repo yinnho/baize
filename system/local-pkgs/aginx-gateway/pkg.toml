@@ -1,0 +1,21 @@
+# aginx-gateway — 对外面守护（baize local-pkgs 覆盖，不改封仓 aginxos-next/pkgs）。
+# v0.2.6（2026-10-31）：生态仓 379a0b4——mcp-api-leg 在 AGINX_API_LEG_INCLUDE_ADMIN
+# 时对 admin 工具透传 --admin（联检仍由 aginx-api publish_admin_gate）。
+# v0.2.5：P3 api-leg 细过滤（生态仓 d99aba9）。
+# v0.2.4：ACP 回合注入 api-leg MCP（生态仓 d892ba0）。
+# 真身仍=生态仓 ~/Documents/aginx/aginx cargo zigbuild musl 静态，本仓只装配。
+name = "aginx-gateway"
+version = "0.2.6"
+summary = "对外面守护（真 aginx）：8443 + ACP api-leg；INCLUDE_ADMIN 透传 --admin"
+group = "net"
+depends = "aginx-secretd"
+url = "https://pkgs.aginx.net/aginx-gateway/v0.2.6/aginx-gateway-v0.2.6-4pc.tar"
+exec = "bin/aginx-gateway"
+
+[service]
+cmd = "/var/lib/aginx/pkgfiles/aginx-gateway/bin/aginx-gateway"
+args = ["-c", "/etc/aginx/config.toml"]
+type = "simple"
+envs = ["AGINX_DATA_DIR=/var/lib/aginx/gateway"]
+env_file = "/etc/aginx/env"
+requires_weak = ["aginx-secretd"]

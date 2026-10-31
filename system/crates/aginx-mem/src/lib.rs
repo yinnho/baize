@@ -38,6 +38,7 @@
 //! kv 域按 (agent, owner, user) 隔离——人面默认身份看不到化身私域是
 //! 正确行为，不是 bug。
 
+pub mod capability;
 pub mod dailycycle;
 pub mod knowledge;
 pub mod kv;
@@ -73,6 +74,13 @@ pub const TOOL_NAMES: &[&str] = &[
     "flow_create",
     "flow_update",
     "flow_load",
+    "capability_propose",
+    "capability_accept",
+    "capability_t1_review",
+    "capability_t2_scan",
+    "capability_materialize_l2",
+    "capability_register_l3",
+    "capability_unregister_l3",
 ];
 
 /// kv/tree 域的身份三元组 + substrate 定位 + knowledge 域的 workspace。
@@ -237,6 +245,13 @@ pub async fn execute_tool(
         "flow_create" => Some(knowledge::flow_create(input, ws.as_deref()).await),
         "flow_update" => Some(knowledge::flow_update(input, ws.as_deref()).await),
         "flow_load" => Some(knowledge::flow_load(input, ws.as_deref()).await),
+        "capability_propose" => Some(capability::capability_propose(input, ws.as_deref()).await),
+        "capability_accept" => Some(capability::capability_accept(input, ws.as_deref()).await),
+        "capability_t1_review" => Some(capability::capability_t1_review(input, ws.as_deref()).await),
+        "capability_t2_scan" => Some(capability::capability_t2_scan(input, ws.as_deref()).await),
+        "capability_materialize_l2" => Some(capability::capability_materialize_l2(input, ws.as_deref()).await),
+        "capability_register_l3" => Some(capability::capability_register_l3(input, ws.as_deref()).await),
+        "capability_unregister_l3" => Some(capability::capability_unregister_l3(input, ws.as_deref()).await),
         _ => None,
     }
 }
@@ -343,12 +358,19 @@ mod tests {
     fn tool_names_are_the_contract() {
         // runtime 桥按这个名字表对齐 definitions；改名 = 破金样本。
         // apply_patch / session_summarize 刻意缺席：留守 runtime。
-        assert_eq!(TOOL_NAMES.len(), 20);
+        assert_eq!(TOOL_NAMES.len(), 27);
         assert!(TOOL_NAMES.contains(&"kv_get"));
         assert!(TOOL_NAMES.contains(&"memory_tree"));
         assert!(TOOL_NAMES.contains(&"knowledge_list"));
         assert!(TOOL_NAMES.contains(&"knowledge_rulings"));
         assert!(TOOL_NAMES.contains(&"flow_load"));
+        assert!(TOOL_NAMES.contains(&"capability_propose"));
+        assert!(TOOL_NAMES.contains(&"capability_accept"));
+        assert!(TOOL_NAMES.contains(&"capability_t1_review"));
+        assert!(TOOL_NAMES.contains(&"capability_t2_scan"));
+        assert!(TOOL_NAMES.contains(&"capability_materialize_l2"));
+        assert!(TOOL_NAMES.contains(&"capability_register_l3"));
+        assert!(TOOL_NAMES.contains(&"capability_unregister_l3"));
         assert!(!TOOL_NAMES.contains(&"apply_patch"));
         assert!(!TOOL_NAMES.contains(&"session_summarize"));
     }

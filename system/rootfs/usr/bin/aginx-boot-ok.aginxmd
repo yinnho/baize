@@ -2,5 +2,6 @@
 # aginx:args=[status] | set-active <a|b> [tries]
 # aginx:examples=status
 # aginx:group=sys
+# aginx:hidden=true
 # aginx:requires-sudo=true
 # 原名 agboot-ok（N4③b 改姓）。rcS calls it bare after `done ok`.

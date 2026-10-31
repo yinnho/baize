@@ -1,2 +1,4 @@
 .local/
 home/traces/
+system/target/
+system/out/
