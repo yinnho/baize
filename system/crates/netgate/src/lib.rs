@@ -204,7 +204,7 @@ pub fn parse_rule_line(line: &str, src: &str) -> Result<Option<Rule>, String> {
 /// 重复条目（同口同面）去重保首。
 pub fn load_rules(src: &RuleSources) -> Result<Vec<Rule>, String> {
     let mut rules: Vec<Rule> = Vec::new();
-    let mut read_file = |p: &Path, rules: &mut Vec<Rule>| -> Result<(), String> {
+    let read_file = |p: &Path, rules: &mut Vec<Rule>| -> Result<(), String> {
         let text = fs::read_to_string(p).map_err(|e| format!("{}：{e}", p.display()))?;
         for (i, line) in text.lines().enumerate() {
             let at = format!("{}:{}", p.display(), i + 1);

@@ -65,9 +65,11 @@ fn main() {
             }
         }
     }
-    if bad || args.is_empty() {
+    // 空参=默认判红绿（usage 首行所诺；baize-gate 门1 裸调）——2026-10-31
+    // 机上首跑抓获：曾照 done 家规空参=usage，夜巡门腿夜夜误判 rc2。
+    if bad {
         println!("{}", usage());
-        exit(if bad { 2 } else { 2 });
+        exit(2);
     }
 
     let listeners = match inventory(&proc_dir()) {

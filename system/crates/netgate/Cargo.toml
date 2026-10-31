@@ -1,6 +1,6 @@
 [package]
 name = "aginx-netgate"
-version.workspace = true
+version = "0.1.1"  # 2026-10-31 空参=默认判（机上首跑抓获）
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
