@@ -1486,6 +1486,12 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    /// AGINX_DATA_DIR 是进程级 env：register/unregister 为给内层
+    /// gateway_registry 递根会临时写它（TempEnvVar），两个并行测试各写
+    /// 各的必互踩（2026-10-31 实锤 1/3 挂率，check 门随机红）。凡触
+    /// materialize/register/unregister/accept-L3 的测试先拿这把锁串行。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn write_gate(home: &Path, enabled: bool) {
         std::fs::write(
             home.join(GATE_FILE),
@@ -1948,6 +1954,7 @@ mod tests {
 
     #[tokio::test]
     async fn l3_register_requires_admin_and_gate() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let home = dir.path();
         write_gate(home, true);
@@ -1984,6 +1991,7 @@ mod tests {
 
     #[tokio::test]
     async fn l3_register_unregister_d17_roundtrip() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let home = dir.path();
         write_gate(home, true);
@@ -2045,6 +2053,7 @@ mod tests {
 
     #[tokio::test]
     async fn l3_accept_needs_approval() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let home = dir.path();
         write_gate(home, true);
