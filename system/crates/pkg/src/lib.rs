@@ -1541,7 +1541,7 @@ pub fn cmd_list(p: &Paths) -> Result<CmdOut, Fail> {
 }
 
 pub fn usage() -> &'static str {
-    "usage: aginx-pkg install <name> <src> <sha256> | sync [manifest] | available [manifest] [--json] \
+    "usage: aginx-pkg install <name> <src|url> <sha256> | sync [manifest] | available [manifest] [--json] \
      | opt-in <name> | rollback <name> | repair [--net] | list [--json]"
 }
 

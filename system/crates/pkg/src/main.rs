@@ -10,8 +10,8 @@ use std::path::Path;
 use std::process::exit;
 
 use aginx_pkg::{
-    cmd_available, cmd_list, cmd_opt_in, cmd_repair, cmd_rollback, cmd_sync, install_file, usage, Fail, Paths,
-    PkgLock,
+    cmd_available, cmd_list, cmd_opt_in, cmd_repair, cmd_rollback, cmd_sync, fetch_install,
+    install_file, usage, Entry, Fail, Paths, PkgLock, Tier,
 };
 
 /// Acquire the cross-process install lock, or yield. A live concurrent
@@ -52,7 +52,24 @@ fn main() {
                 _ => die_usage(),
             };
             let _lock = lock_or_yield(&p, json);
-            match install_file(&p, name, Path::new(src), sha) {
+            // <src> accepts https:// — ride the manifest's own fetch leg
+            // (aginx-download + gh-proxy retry; sha-pinned before anything
+            // is touched). A remote agent has no adb push, so install must
+            // swallow URLs the way sync already does.
+            let r = if src.starts_with("https://") {
+                let entry = Entry {
+                    name: name.to_string(),
+                    url: src.to_string(),
+                    sha256: sha.to_string(),
+                    tier: Tier::Opt,
+                    version: None,
+                    deps: Vec::new(),
+                };
+                fetch_install(&p, &entry)
+            } else {
+                install_file(&p, name, Path::new(src), sha)
+            };
+            match r {
                 Ok(aginx_pkg::Kind::Binary) => println!("aginx-pkg: installed {name} ({sha})"),
                 Ok(aginx_pkg::Kind::Bundle { unit, .. }) => {
                     println!("aginx-pkg: installed {name} bundle ({sha}) — skill{}", if unit { " + unit" } else { "" })
