@@ -1,9 +1,10 @@
 #!/bin/sh
-# baize:summary=收割当日会话真源→traces 材料（session log = truth source）
+# baize:summary=收割当日会话真源→traces 材料 + T2 能力候选 hints（session log = truth source）
 # baize:args=[项目dir…]（缺省=baize+aginxos-next 两 key）
 # baize:group=memory
-# v0 只收主人侧发言（user 消息）——拍板与口令的真源；劳力侧长文不进
-# 材料。任何 key=value 形态的秘密一律打码后才落 traces。
+# v0 会话材料只收主人侧发言（user）——拍板与口令的真源；劳力侧长文不进
+# sessions 材料。T2 hints 另收：主人固化口令 + 工具名指纹（不含 tool args）。
+# 任何 key=value 形态的秘密一律打码后才落 traces。
 set -eu
 B=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
 ROOT=$(cd "$B/.." && pwd)
@@ -28,21 +29,70 @@ redact() {
 }
 
 OUT="$T/$DAY-sessions.md"; : > "$OUT"
+HINTS="$T/$DAY-capability-hints.md"
+{
+  echo "# capability-hints $DAY"
+  echo "# baize-harvest T2 materials; secrets «REDACTED»; tool args never recorded"
+  echo
+  echo "## cues"
+} > "$HINTS"
+CUES_TMP=$(mktemp /tmp/.bh.cues.XXXXXX)
+FP_TMP=$(mktemp /tmp/.bh.fp.XXXXXX)
+: > "$CUES_TMP"; : > "$FP_TMP"
+
 n=0
 for d in $DIRS; do
   [ -d "$d" ] || continue
   for f in $(find "$d" -maxdepth 1 -name '*.jsonl' -newer "$STAMP" 2>/dev/null); do
+    base=${f##*/}
     {
-      echo "===== 会话 ${f##*/} ====="
+      echo "===== 会话 $base ====="
       jq -r 'select(.type=="user") | .message.content | if type=="string" then . else ([.[]? | select(.type=="text") | .text] | join("\n")) end' "$f" 2>/dev/null \
         | grep -v '^$' \
         | redact \
         | head -c 24000
       echo
     } >> "$OUT"
+
+    # 主人固化口令 → cues（打码后）
+    jq -r 'select(.type=="user") | .message.content | if type=="string" then . else ([.[]? | select(.type=="text") | .text] | join("\n")) end' "$f" 2>/dev/null \
+      | redact \
+      | grep -E '下次照这样|下次按这样|做成流程|固定下来|固化成|存成能力|下次也这样|照这个流程' \
+      | head -n 20 \
+      | while IFS= read -r line; do
+          # 单行帽，避免把长文塞进 hints
+          short=$(printf '%s' "$line" | head -c 200)
+          printf -- '- cue: %s | session: %s\n' "$short" "$base" >> "$CUES_TMP"
+        done || true
+
+    # 工具名指纹（有序，最多 12；不含 input/args）
+    tools=$(jq -r 'select(.type=="assistant") | .message.content | select(type=="array") | .[]? | select(.type=="tool_use") | .name' "$f" 2>/dev/null \
+      | head -n 12 | tr '\n' '|' | sed 's/|$//')
+    if [ -n "$tools" ]; then
+      # bag = 排序去重，跨日「同类编排」比对用
+      bag=$(printf '%s' "$tools" | tr '|' '\n' | grep -v '^$' | sort -u | tr '\n' '+' | sed 's/+$//')
+      tools_n=$(printf '%s' "$tools" | tr '|' '\n' | grep -c . || true)
+      printf -- '- fingerprint: %s | bag: %s | day: %s | session: %s | tools_n: %s\n' \
+        "$tools" "$bag" "$DAY" "$base" "$tools_n" >> "$FP_TMP"
+    fi
     n=$((n+1))
   done
 done
-if [ $n -eq 0 ]; then echo "baize-harvest: 今日无会话"; rm -f "$STAMP"; exit 0; fi
+
+if [ -s "$CUES_TMP" ]; then cat "$CUES_TMP" >> "$HINTS"; else echo "- (none)" >> "$HINTS"; fi
+{
+  echo
+  echo "## fingerprints"
+} >> "$HINTS"
+if [ -s "$FP_TMP" ]; then cat "$FP_TMP" >> "$HINTS"; else echo "- (none)" >> "$HINTS"; fi
+rm -f "$CUES_TMP" "$FP_TMP"
+
+if [ $n -eq 0 ]; then
+  echo "baize-harvest: 今日无会话"
+  # 仍落空 hints，方便 day/t2_scan 认当日文件存在
+  rm -f "$STAMP"
+  echo "baize-harvest: hints → $HINTS (empty day)"
+  exit 0
+fi
 rm -f "$STAMP"
-echo "baize-harvest: $n 个会话 → $OUT ($(wc -c < "$OUT" | tr -d ' ')B)"
+echo "baize-harvest: $n 个会话 → $OUT ($(wc -c < "$OUT" | tr -d ' ')B); hints → $HINTS"

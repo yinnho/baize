@@ -48,6 +48,9 @@ trap 'rm -rf "$STAGE"' EXIT
 - 材料与已有正典同题→重写同名文件，不另立新档。
 - 只写知识件 .md，不改其他文件；提炼不抄原文长段；秘密（密钥/口令）
   永不写入。
+- 能力固化候选（T2）不写进本目录：由 night 链的 capability_t2_scan
+  根据 traces/*-capability-hints.md 另产提案；此处勿 mkdir workflows、
+  勿写名册。
 
 EOF
   echo '===== 人格件 home/AGENTS.md ====='; cat "$H/AGENTS.md"
@@ -94,3 +97,18 @@ printf '{"ts":"%s","day":"%s","engine":"%s","added":[%s]}\n' \
   >> "$H/history/versions.jsonl"
 
 echo "baize-day: 落位 ${ADDED}（名册重建、版本账+1）"
+
+# P3 T2：非 stub 时扫 capability-hints → 候选提案（闸关则只报告零落盘）
+# --stub 出生绿门不跑，避免强产候选。
+if [ "$STUB" -eq 0 ]; then
+  MEM=""
+  for c in aginx-mem "$ROOT/system/target/release/aginx-mem" "$ROOT/system/target/debug/aginx-mem" /var/bin/aginx-mem; do
+    if command -v "$c" >/dev/null 2>&1; then MEM=$(command -v "$c"); break; fi
+    if [ -x "$c" ]; then MEM="$c"; break; fi
+  done
+  if [ -n "$MEM" ]; then
+    echo '{}' | "$MEM" tool capability_t2_scan --workspace "$H"       && echo "baize-day: capability_t2_scan ok"       || echo "baize-day: capability_t2_scan soft-fail（不阻断心跳）" >&2
+  else
+    echo "baize-day: skip capability_t2_scan（无 aginx-mem）"
+  fi
+fi

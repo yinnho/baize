@@ -1,0 +1,5 @@
+# 能力固化总闸（SELF-EVOLUTION P0/P3）
+# 默认关。打开后才允许 capability_propose / capability_accept / T2 夜巡提案落盘。
+# 勿与 EVOLUTION.md 的 self_growth_enabled 混用（那是另一条轨）。
+enabled = false
+t2_repeat_threshold = 2
