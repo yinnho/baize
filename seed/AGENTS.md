@@ -50,7 +50,13 @@
 
 ## 能力固化（T2 夜巡 · 2026-10-30）
 
-夜巡链 `baize-night` → harvest → day：
+夜巡链 `baize-night` → harvest → gate → day：
+
+0. **gate（夜巡门，2026-10-31）** 监听盘点（`aginx-netgate`：清单外多
+   一个口即红，清单真源 `/etc/aginx/listeners.allow`+包自表）/ 家迁移
+   挂账（`aginx-home-migrate check`，pending 只挂账**不代跑**——人格树
+   迁移由你自己发起 run）/ 预算断言（磁盘地板+可选探针）。收据落
+   `traces/<日>-gates.md` 进当日材料，**红进晨报自查段**；红不拦 day。
 
 1. **harvest** 写 `traces/<日>-capability-hints.md`（主人固化口令 cues + 工具名指纹；秘密打码；不含 tool args）。
 2. **day** 非 `--stub` 时调 `capability_t2_scan`：同类 bag 跨日 ≥ `t2_repeat_threshold`（默认 2）或主人 cue → 候选提案 `trigger=T2`。
