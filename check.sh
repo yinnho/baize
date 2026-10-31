@@ -16,5 +16,14 @@ printf '# 2077-01-01 合成材料\n\n主人钦定测试暗号「红磷」。有�
 BAIZE_HOME="$TMP/home" "$ROOT/bin/baize-day" --stub "$TMP/home/traces/2077-01-01-test.md" >/dev/null
 grep -q 'stub-beat' "$TMP/home/MEMORY.md" || { echo "check: 名册缺件" >&2; exit 1; }
 [ "$(wc -l < "$TMP/home/history/versions.jsonl" | tr -d ' ')" -ge 1 ] || { echo "check: 版本账空" >&2; exit 1; }
+
+# 夜巡门腿（2026-10-31）：host 上两把枪未装=黄，磁盘地板过 → 必须 rc 0
+# 且收据落 traces（红路径的断言住 crates/netgate 的测试里，这里只验
+# 腿本身不炸、材料照落）。
+BAIZE_HOME="$TMP/home" "$ROOT/bin/baize-gate" >/dev/null 2>&1 \
+  || { echo "check: 夜巡门腿炸了" >&2; exit 1; }
+test -s "$TMP/home/traces/$(date +%F)-gates.md" \
+  || { echo "check: 夜巡门收据缺" >&2; exit 1; }
+
 BAIZE_HOME="$TMP/home" "$ROOT/bin/baize-k" verify || { echo "check: 合成正典体检不过" >&2; exit 1; }
 echo "check: ok（正典体检 + 合成心跳全过）"

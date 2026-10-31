@@ -6,7 +6,10 @@
 # 腿（全是 sh+jq，PATH 面 CLI，不注册 aginx 命令面——姓=baize）：
 #   baize day      心跳：当日材料→引擎整理→候选三关→正典+版本账
 #                  （--stub = 不烧脑测试腿）
-#   baize night    夜巡入口（crontab 23:47：harvest + day）
+#   baize night    夜巡入口（crontab 23:47：harvest + gate + day）
+#   baize gate     夜巡门（2026-10-31）：监听盘点（调 /var/bin 的
+#                  aginx-netgate，未装=黄挂账）/家迁移挂账/预算断言 →
+#                  traces/<日>-gates.md（红进晨报自查段）
 #   baize harvest  收割当日材料（秘密打码；traces 永不入库）
 #   baize k        知识面：list / show / rulings / gaps / verify / roster
 #   baize adopt    认祖归宗：旧身体正典一次性血缘继承（不是同步）
@@ -15,8 +18,8 @@
 # （AGENTS.md + 四件通用正典 + 空名册）并接 23:47 心跳。已有记忆的
 # 机器（家中有 AGENTS.md）永不触碰。
 name = "baize"
-version = "0.1.2"
-summary = "白泽心跳与出厂底模：五腿 + seed（夜巡设备化四修；种带聊天面纪律）"
+version = "0.1.3"
+summary = "白泽心跳与出厂底模：六腿 + seed（夜巡门 baize-gate：监听盘点/家迁移挂账/预算断言）"
 group = "core"
-url = "https://pkgs.aginx.net/baize/v0.1.2/baize-v0.1.2-4pc.tar"
+url = "https://pkgs.aginx.net/baize/v0.1.3/baize-v0.1.3-4pc.tar"
 exec = "bin/baize"

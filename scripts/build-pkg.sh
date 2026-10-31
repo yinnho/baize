@@ -12,7 +12,7 @@ trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/files/bin" "$STAGE/files/seed"
 
 cp pkg/baize/pkg.toml pkg/baize/SKILL.md "$STAGE/"
-cp bin/baize bin/baize-day bin/baize-night bin/baize-harvest bin/baize-k bin/baize-adopt "$STAGE/files/bin/"
+cp bin/baize bin/baize-day bin/baize-night bin/baize-harvest bin/baize-k bin/baize-adopt bin/baize-gate "$STAGE/files/bin/"
 cp -R seed/. "$STAGE/files/seed/"
 find "$STAGE/files/seed" -name '.DS_Store' -delete
 

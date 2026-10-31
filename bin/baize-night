@@ -1,8 +1,13 @@
 #!/bin/sh
-# baize:summary=夜巡：收割当日会话→心跳整理（crontab 入口，23:47 同二代时辰）
+# baize:summary=夜巡：收割当日会话→门腿断言→心跳整理（crontab 入口，23:47 同二代时辰）
 # baize:group=memory
+# 门腿（NETWORK-SURFACE P0）在 day 之前跑：gates 收据落 traces 进当日
+# 材料（红→晨报自查段）；红不拦 day——先收割整理，红留给第二天早处理。
 set -eu
 B=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
 if [ -z "${BAIZE_HOME:-}" ]; then echo "baize-night: 需要 BAIZE_HOME（crontab 23:47 腿自带）" >&2; exit 2; fi
 "$B/baize-harvest"
+RC=0
+"$B/baize-gate" || RC=$?
 "$B/baize-day"
+exit "$RC"

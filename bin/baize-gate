@@ -1,0 +1,96 @@
+#!/bin/sh
+# baize:summary=夜巡门：监听盘点/家迁移挂账/预算断言→traces/<日>-gates.md（红进当日材料=晨报自查段）
+# baize:args=[腿开关见各段 BAIZE_GATE_*]
+# baize:group=memory
+# NETWORK-SURFACE v2 P0 的常驻断言住这：清单外多一个口=红（aginx-netgate）；
+# 家迁移先只挂账（aginx-home-migrate check，系统自己 run）；预算断言回退即红。
+# 红不拦夜巡（day 照跑，材料里带红）；rc 非 0 = 有红腿，crond 日志可见。
+# busybox 纪律：只用 sed/set --/test，无 awk（底盘死雷）。
+set -u
+B=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+ROOT=$(cd "$B/.." && pwd)
+if [ -n "${BAIZE_HOME:-}" ]; then H="$BAIZE_HOME"
+elif [ -f "$ROOT/home/AGENTS.md" ]; then H="$ROOT/home"
+else echo "baize-gate: 需要 BAIZE_HOME（安装正典 §8）" >&2; exit 2; fi
+T="$H/traces"; mkdir -p "$T"
+DAY=$(date +%F); OUT="$T/$DAY-gates.md"
+PATH="$PATH:/var/bin"
+RED=0
+
+{
+  echo "# gates $DAY"
+  echo "# 夜巡门收据：清单外即红；黄=挂账（不拦夜巡）；绿=过"
+  echo
+} > "$OUT"
+
+red() { RED=1; echo "RED   $1" >> "$OUT"; echo "baize-gate: RED $1" >&2; }
+yellow() { echo "YELLOW $1" >> "$OUT"; }
+green() { echo "green $1" >> "$OUT"; }
+
+# —— 门1 监听盘点（NETWORK-SURFACE P0；rc3=红 rc1=盘点不能）——
+if command -v aginx-netgate >/dev/null 2>&1; then
+  if aginx-netgate >> "$OUT" 2>&1; then
+    green "监听盘点过（清单即面）"
+  else
+    rc=$?
+    if [ "$rc" -eq 3 ]; then
+      red "监听盘点：清单外/面不符（详情见上）"
+    else
+      yellow "监听盘点不能判（rc=$rc：无 /proc 或坏清单行——当查，不是绿）"
+    fi
+  fi
+else
+  yellow "aginx-netgate 未装（local-pkgs/aginx-netgate）——门在但没枪"
+fi
+echo >> "$OUT"
+
+# —— 门2 家迁移挂账（先守望不代跑：系统自己发起 run）——
+if command -v aginx-home-migrate >/dev/null 2>&1; then
+  if aginx-home-migrate list >> "$OUT" 2>&1; then
+    green "家迁移：无待跑/无改稿"
+  else
+    rc=$?
+    if [ "$rc" -eq 3 ]; then
+      yellow "家迁移有 pending/EDITED（见上）——系统自跑或主人裁决，夜巡不代劳"
+    else
+      red "家迁移 list rc=$rc（盘点腿本身坏——当查）"
+    fi
+  fi
+else
+  yellow "aginx-home-migrate 未装（local-pkgs/aginx-home-migrate）"
+fi
+echo >> "$OUT"
+
+# —— 门3 预算断言（回退即红；墙上钟只管回归，不做机间比较）——
+# 磁盘地板：家所在盘 avail（KB）低于地板=红。地板 BAIZE_GATE_DISK_MB
+# 缺省 512MB。busybox df -Pk 输出 sed -n 2p 取第 4 列（set --，无 awk）。
+avail=$(set -- $(df -Pk "$H" 2>/dev/null | sed -n '2p'); echo "${4:-0}")
+floor=$(( ${BAIZE_GATE_DISK_MB:-512} * 1024 ))
+if [ "${avail:-0}" -ge "$floor" ] 2>/dev/null; then
+  green "磁盘地板：${avail}KB ≥ ${floor}KB"
+else
+  red "磁盘地板：${avail}KB < ${floor}KB（先清 traces/历史再论）"
+fi
+
+# 通用预算探针（默认关）：BAIZE_GATE_PROBE_CMD='整条命令' +
+# BAIZE_GATE_PROBE_S=秒预算（挂钟回退检测：relay 往返/turn 延迟用这腿量，
+# 预算值=NETWORK-SURFACE/收据里的在役实测，不是拍脑袋）。
+if [ -n "${BAIZE_GATE_PROBE_CMD:-}" ]; then
+  budget="${BAIZE_GATE_PROBE_S:-10}"
+  t0=$(date +%s)
+  if sh -c "$BAIZE_GATE_PROBE_CMD" >> "$OUT" 2>&1; then
+    t1=$(( $(date +%s) - t0 ))
+    if [ "$t1" -le "$budget" ]; then
+      green "探针 ${t1}s ≤ ${budget}s"
+    else
+      red "探针 ${t1}s > ${budget}s（回退即红）"
+    fi
+  else
+    yellow "探针跑不动（命令失败——当查）"
+  fi
+fi
+
+echo >> "$OUT"
+echo "（gates 腿收据完；有红腿=晨报自查段必见）" >> "$OUT"
+echo "baize-gate: 收据 → $OUT" >&2
+exit "$RED"
