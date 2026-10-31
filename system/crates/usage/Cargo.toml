@@ -1,0 +1,25 @@
+[package]
+name = "aginx-agent-usage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# aginx-agent-usage — 引擎用量归一契约（omacom usage-collector 借鉴，
+# 2026-10-31 新轮刀②）。引擎是商品劳力（claude/codex/grok 各自的会话
+# 记录形状各异），主人的账只有一种：一个引擎一天烧了多少 token/回合/
+# 时长。本 crate 定死 ONE JSON record schema + emit（flock 串行追加）
+# + report（按引擎/日聚合）。各引擎的采集器（读引擎自己的会话档→
+# 摘增量→调 emit）后续按引擎逐个落，不在本 crate 里。
+# 记录家 /var/lib/aginx/usage/<日>.jsonl：机器本地的劳力账，不是人格
+# 记忆（不随认祖走）。数字一律 zeroed-not-null（缺数=0，不写 null）。
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = "0.2"
+agio = { path = "../agio" }
+
+[[bin]]
+name = "aginx-agent-usage"
+path = "src/main.rs"

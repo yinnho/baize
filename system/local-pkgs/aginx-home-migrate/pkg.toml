@@ -1,0 +1,11 @@
+# aginx-home-migrate — /home 迁移层 runner（omacom 每用户迁移借鉴，
+# 2026-10-31 新轮刀①）。PATH 面 CLI：不注册 aginx 命令面；夜巡门腿
+# bin/baize-gate 挂账守望，系统/主人发起 run。真源 system/crates/homemig。
+# 部件：bin/aginx-home-migrate（aarch64-linux-musl 全静态）。
+name = "aginx-home-migrate"
+version = "0.1.0"
+summary = "/home 人格树迁移层：顺序/幂等/机内标记/改稿拒跑（系统自己长的人格面）"
+group = "sys"
+url = "https://pkgs.aginx.net/aginx-home-migrate/v0.1.0/aginx-home-migrate-v0.1.0-4pc.tar"
+
+exec = "bin/aginx-home-migrate"

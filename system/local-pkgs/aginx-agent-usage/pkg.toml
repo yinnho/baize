@@ -1,0 +1,11 @@
+# aginx-agent-usage — 引擎用量归一契约（omacom usage-collector 借鉴，
+# 2026-10-31 新轮刀②）。PATH 面 CLI：不注册 aginx 命令面。真源
+# system/crates/usage。部件：bin/aginx-agent-usage（aarch64-linux-musl）。
+# 记录家 /var/lib/aginx/usage/<UTC日>.jsonl = 机器本地劳力账（不随认祖走）。
+name = "aginx-agent-usage"
+version = "0.1.0"
+summary = "引擎用量归一：ONE record schema + emit(flock) + report 聚合（采集器后挂）"
+group = "agent"
+url = "https://pkgs.aginx.net/aginx-agent-usage/v0.1.0/aginx-agent-usage-v0.1.0-4pc.tar"
+
+exec = "bin/aginx-agent-usage"

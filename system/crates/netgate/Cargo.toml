@@ -1,0 +1,25 @@
+[package]
+name = "aginx-netgate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# aginx-netgate — 监听盘点门（NETWORK-SURFACE v2 P0，2026-10-31）。
+# 直接解析 /proc/net/tcp{,6} 文本（不借 netstat/awk 外腿——phone 底盘
+# busybox 那套必 segfault，见二代死雷收据），对允许清单盘点 TCP 监听：
+# 清单外的口、或口在但绑的面比清单窄/宽 = 红。清单三源并入：
+#   /etc/aginx/listeners.allow          平台根正本（人/ops 手）
+#   /etc/aginx/listeners.allow.d/*.allow drop-in（同目录）
+#   /var/lib/aginx/pkgfiles/*/netgate.allow  包自表（开监听的包自带条目）
+# 无策略时不放行：有监听而清单为空 = 全员 offender（fail-closed）。
+# PATH 面 CLI（一切皆CLI 裁决，同 sqlite3/git 口味）：不注册 aginx 命令面，
+# 夜巡门腿 bin/baize-gate 与主人直接调。
+[dependencies]
+serde_json = { workspace = true }
+agio = { path = "../agio" }
+
+[[bin]]
+name = "aginx-netgate"
+path = "src/main.rs"

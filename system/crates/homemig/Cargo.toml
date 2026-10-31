@@ -1,0 +1,26 @@
+[package]
+name = "aginx-home-migrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# aginx-home-migrate — /home 迁移层 runner（omacom 每用户迁移借鉴，
+# 2026-10-31 新轮刀①）。人格树是长出来的：格式演进（目录改名/文件
+# 形状换代）以前只靠「前向兼容+知识件自描述」，没有一条可验收的
+# 迁移正路。本 crate 是机身侧的施法器：迁移稿住在人格树
+# ${AGINX_HOME}/migrations/NNN-slug.sh（改「人」的件，duphub 可分发），
+# 机内标记落 /var/lib/aginx/home-migrate/（这台身体施过哪些法）。
+# 纪律（lib.rs 头注释是正典）：严格顺序、幂等（认祖到新身体会重跑）、
+# 失败即停不落标记、发布后不改稿（sha 对不上=拒跑，要改就新编号）。
+# provision/boot 永不代跑（HOME-PHASE Finalize 禁 silent /home 写）——
+# 由系统自己在夜巡/会话里跑，夜巡门腿先只挂账守望。
+[dependencies]
+serde_json = { workspace = true }
+sha2 = "0.10"
+agio = { path = "../agio" }
+
+[[bin]]
+name = "aginx-home-migrate"
+path = "src/main.rs"

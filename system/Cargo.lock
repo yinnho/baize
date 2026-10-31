@@ -60,6 +60,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aginx-agent-usage"
+version = "0.1.0"
+dependencies = [
+ "agio",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aginx-api"
 version = "0.1.0"
 dependencies = [
@@ -130,6 +140,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aginx-home-migrate"
+version = "0.1.0"
+dependencies = [
+ "agio",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "aginx-img"
 version = "0.1.0"
 dependencies = [
@@ -161,6 +180,14 @@ name = "aginx-net-wizard"
 version = "0.1.0"
 dependencies = [
  "wificonf",
+]
+
+[[package]]
+name = "aginx-netgate"
+version = "0.1.0"
+dependencies = [
+ "agio",
+ "serde_json",
 ]
 
 [[package]]

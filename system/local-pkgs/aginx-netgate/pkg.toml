@@ -1,0 +1,11 @@
+# aginx-netgate — 监听盘点门（NETWORK-SURFACE v2 P0，2026-10-31）。
+# PATH 面 CLI（一切皆CLI 裁决，同 sqlite3/git 口味）：不注册 aginx 命令面；
+# 夜巡门腿 bin/baize-gate 与主人直接调。真源 system/crates/netgate。
+# 部件：bin/aginx-netgate（aarch64-linux-musl 全静态，cargo-zigbuild）。
+name = "aginx-netgate"
+version = "0.1.0"
+summary = "监听盘点门：/proc 盘点 TCP 监听对允许清单判红绿，清单外即红"
+group = "sys"
+url = "https://pkgs.aginx.net/aginx-netgate/v0.1.0/aginx-netgate-v0.1.0-4pc.tar"
+
+exec = "bin/aginx-netgate"
