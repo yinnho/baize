@@ -8,19 +8,17 @@
 #   listeners.allow.d/*.allow      本目录 drop-in
 #   /var/lib/aginx/pkgfiles/*/netgate.allow   包自表（开监听的包自带）
 #
-# 纪律：这是「今天的事实」+「收口目标写注释」。收紧时把对应 @* 行
-# 换成 @127.0.0.1（面收口先行/同批落），别留想象中的条目。
+# 纪律：这里写今天的事实，不写愿望；收紧=改清单+改 bind 同批。
+# 2026-10-31 redfin 机上首跑实证：8089/8686/8800 在役即 loopback，
+# 方案里「P0 收口」已是既成事实——Exact 面入表，任何一面外扩即红。
 
-# —— L0 宪法腿：ssh 救命腿（永不关；LAN 收口后可再紧）——
+# —— L0 宪法腿：ssh 救命腿（永不关；LAN+pubkey 收口另行裁决）——
 22@*
 
-# —— 在役两本地面（引擎 8089 / gateway prompt face 8686）——
-# P0 收口目标 = loopback（NETWORK-SURFACE §一）；面上把 bind 改过来
-# 后，把上两行换成下面注释里的事实，盘点门随之转严：
-8089@*
-8686@*
-# 8089@127.0.0.1
-# 8686@127.0.0.1
+# —— 在役本地面（全部 127.0.0.1；面外扩=红）——
+8089@127.0.0.1   # diting/aginxbrowser 引擎面（本机 ask/archify 消费）
+8686@127.0.0.1   # gateway prompt face raw TCP JSONL（本机 ACP）
+8800@127.0.0.1   # stunnel 代理腿 aginx-proxy（包自表化挂账）
 
 # —— 直连模式（可选 agent:// 口，开时才写；relay 模式=零入站默认）——
 # 86@*

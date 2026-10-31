@@ -30,8 +30,8 @@ fi
 
 case "${1:-}" in
   ""|-h|--help)
-    echo "usage: baize <day|night|harvest|adopt|k> [args…]" ;;
-  day|night|harvest|adopt|k)
+    echo "usage: baize <day|night|harvest|gate|adopt|k> [args…]" ;;
+  day|night|harvest|gate|adopt|k)
     exec "$B/baize-$@" ;;
   *)
     echo "baize: 未知腿 $1" >&2; exit 2 ;;
