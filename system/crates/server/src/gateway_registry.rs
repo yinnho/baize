@@ -34,6 +34,10 @@ const ROSTER_HEADER: &str = "# workflows 助理能力注册表\n\
      <!-- aginx 安装链自动维护（agent install/remove 同步写）；\n\
      系统智能体读此册知编制、据此派活。行格式：- `名`: 显示名 —— 描述 -->\n";
 
+/// 安全线地板（2026-10-25）：system 条目=本机 root shell 面，owner/relay
+/// 两个 principal 永在——boot 重写不洗，手改文件也拆不掉（要拆=改代码）。
+const SYSTEM_ACL_FLOOR: [&str; 2] = ["owner", "relay"];
+
 /// 条目行键（解析侧刀5 对齐）：`- `name`: …`
 fn roster_line(name: &str, display: &str, desc: &str) -> String {
     let desc = if desc.is_empty() { "（无描述）" } else { desc };
@@ -229,6 +233,11 @@ pub fn remove_entry(root: &Path, name: &str) -> std::io::Result<()> {
 /// --skip-git-repo-check（folder 非信任目录防首帧被拒）、resume 走
 /// codex thread。工作流助理条目（write_entry）④-3 起同形（folder=
 /// workflows/<名>）。
+/// 安全线地板+授权保续（2026-10-31，频道桥教训）：owner/relay 地板
+/// 永在，但设备侧正当授权（svc:<名>-bridge）落盘后 boot 重写保续
+/// ——原「无条件覆盖」把每条频道桥授权洗成哑巴渠道（耳朵活着、
+/// 脑链 403，redfin 微信线聋三天的根因）。回收=改文件删条目，下次
+/// 重写即生效。
 fn write_system_entry(
     root: &Path,
     home: &Path,
@@ -243,11 +252,82 @@ fn write_system_entry(
                   # codex（引擎商品化）；人格=home 根 AGENTS.md；CODEX_HOME 钉死\n\
                   # <home>/.codex（#450）。\n\
                   # [access] 名册 ACL（安全线 2026-10-25，生态仓 v0.2.1）：system=\n\
-                  # 本机 root shell 面，只许 owner/relay；本腿匿名/客户端 token 拒。\n";
+                  # 本机 root shell 面，地板只许 owner/relay（洗不掉）；额外授权\n\
+                  # （svc:<名>-bridge 等）落盘保续，回收=改文件删条目。\n";
     let mut body = codex_entry_toml(header, name, display, desc, home, home, 900);
-    // boot 重写无条件覆盖——ACL 必须在模板里，设备侧手改会被洗掉
-    body.push_str("\n[access]\nprincipals = [\"owner\", \"relay\"]\n");
+    // 地板+保续：旧文件的 [access] principals 并入地板（保续授权）。
+    let prior = std::fs::read_to_string(dir.join("aginx.toml")).ok();
+    let principals = merged_principals(prior.as_deref());
+    let list = principals
+        .iter()
+        .map(|p| toml_str(p))
+        .collect::<Vec<_>>()
+        .join(", ");
+    body.push_str(&format!("\n[access]\nprincipals = [{list}]\n"));
     std::fs::write(dir.join("aginx.toml"), body)
+}
+
+/// 从既有条目正文抠 `[access]` 的 principals（单行数组形——生成器
+/// 自己写的形，设备侧 sed 运维同款）。找不到/不成形 → None（调用方
+/// 落地板）。principal 是标识符形（owner / svc:xxx），引号内不做
+/// TOML 级转义解包——该格式里不会出现。
+fn existing_principals(body: &str) -> Option<Vec<String>> {
+    let mut in_access = false;
+    for line in body.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if t.starts_with('[') {
+            in_access = t == "[access]";
+            continue;
+        }
+        if !in_access {
+            continue;
+        }
+        let rest = match t.strip_prefix("principals") {
+            Some(r) if r.starts_with(|c: char| c.is_whitespace() || c == '=') => r,
+            _ => continue,
+        };
+        let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+        let open = rest.find('[')?;
+        let close = rest.rfind(']')?;
+        if close <= open {
+            return None;
+        }
+        let inner = &rest[open + 1..close];
+        let mut out = Vec::new();
+        let mut buf: Option<String> = None;
+        for c in inner.chars() {
+            match c {
+                '"' => match buf.take() {
+                    Some(s) => out.push(s),
+                    None => buf = Some(String::new()),
+                },
+                c => {
+                    if let Some(s) = buf.as_mut() {
+                        s.push(c);
+                    }
+                }
+            }
+        }
+        return Some(out);
+    }
+    None
+}
+
+/// 地板 ∪ 既有授权：地板在前（确定性输出），既有里非空且不重的
+/// 追加保序。既有不可解析（无段/无行/垃圾）→ 纯地板。
+fn merged_principals(prior: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = SYSTEM_ACL_FLOOR.iter().map(|s| s.to_string()).collect();
+    if let Some(list) = prior.and_then(existing_principals) {
+        for p in list {
+            if !p.is_empty() && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 /// ② workflows.md 行 upsert（按键 `- `name`:` 替换；全册按名排序，重写
@@ -454,6 +534,65 @@ mod tests {
         write_system_entry(&d, &home, "system", "系统", "改").unwrap();
         let t2 = std::fs::read_to_string(d.join("agents/system/aginx.toml")).unwrap();
         assert!(t2.contains("改"));
+        for p in [d, home] {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+
+    /// 安全线地板+授权保续（2026-10-31）：boot 重写不再洗设备侧授权
+    /// （svc:weixin-bridge 被洗=微信线聋三天的根因）；地板 owner/relay
+    /// 手改也拆不掉；回收=改文件删条目；既有不成形→安全回落地板。
+    #[test]
+    fn system_entry_acl_floor_and_preserve() {
+        let d = tmp("aclfloor");
+        let home = tmp("aclhome");
+        let path = d.join("agents/system/aginx.toml");
+        // 无既有文件 → 纯地板
+        write_system_entry(&d, &home, "system", "系统", "d").unwrap();
+        let t1 = std::fs::read_to_string(&path).unwrap();
+        assert!(t1.contains("principals = [\"owner\", \"relay\"]"));
+        // 设备侧授权（sed 同款形）→ boot 重写保续
+        let granted = t1.replace(
+            "principals = [\"owner\", \"relay\"]",
+            "principals = [\"owner\", \"relay\", \"svc:weixin-bridge\"]",
+        );
+        std::fs::write(&path, granted).unwrap();
+        write_system_entry(&d, &home, "system", "系统", "d2").unwrap();
+        let t2 = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            t2.contains("principals = [\"owner\", \"relay\", \"svc:weixin-bridge\"]"),
+            "授权保续：\n{t2}"
+        );
+        // 手改想拆地板 → boot 补回（地板在前，保续在后）
+        let stripped = t2.replace(
+            "principals = [\"owner\", \"relay\", \"svc:weixin-bridge\"]",
+            "principals = [\"svc:weixin-bridge\"]",
+        );
+        std::fs::write(&path, stripped).unwrap();
+        write_system_entry(&d, &home, "system", "系统", "d3").unwrap();
+        let t3 = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            t3.contains("principals = [\"owner\", \"relay\", \"svc:weixin-bridge\"]"),
+            "地板永在+额外保续：\n{t3}"
+        );
+        // 回收：文件里删掉额外条目 → 下次重写不再回来
+        let revoked = t3.replace(", \"svc:weixin-bridge\"", "");
+        std::fs::write(&path, revoked).unwrap();
+        write_system_entry(&d, &home, "system", "系统", "d4").unwrap();
+        let t4 = std::fs::read_to_string(&path).unwrap();
+        assert!(!t4.contains("weixin-bridge"), "回收生效：\n{t4}");
+        assert!(t4.contains("principals = [\"owner\", \"relay\"]"));
+        // 既有文件无 [access] 段（旧形条目）→ 补地板
+        let legacy = t4.split("\n[access]").next().unwrap().to_string();
+        std::fs::write(&path, &legacy).unwrap();
+        write_system_entry(&d, &home, "system", "系统", "d5").unwrap();
+        let t5 = std::fs::read_to_string(&path).unwrap();
+        assert!(t5.contains("principals = [\"owner\", \"relay\"]"));
+        // principals 行不成形（垃圾）→ 不 panic、安全回落地板
+        std::fs::write(&path, format!("{legacy}\n[access]\nprincipals = 坏的\n")).unwrap();
+        write_system_entry(&d, &home, "system", "系统", "d6").unwrap();
+        let t6 = std::fs::read_to_string(&path).unwrap();
+        assert!(t6.contains("principals = [\"owner\", \"relay\"]"), "垃圾回退：\n{t6}");
         for p in [d, home] {
             let _ = std::fs::remove_dir_all(p);
         }
