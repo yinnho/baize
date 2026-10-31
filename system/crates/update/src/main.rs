@@ -231,7 +231,14 @@ const STATE_MAX: u64 = 512 << 20;
 /// /var/lib/aginx/pkgfiles/<pkg>/ 下，~450MB 会撞 STATE_MAX 顶——大件可
 /// 重下物不进 state tar（与 /var/bin 同律：换像后 resync 判 missing 自动
 /// 补拉）。/var/models 的 symlink 让位 ensure 归 provision（每靴）。
-const STATE_TAR_EXCLUDES: &str = "--exclude=etc/aginx/svc.d --exclude=etc/aginx/secret.policy --exclude=etc/aginx/gateway.toml --exclude=etc/aginx/groups.desc --exclude=etc/aginx/device.toml --exclude=var/lib/aginx/pkgfiles/aginx-asr --exclude=var/lib/aginx/pkgfiles/aginx-tts --exclude=var/lib/aginx/pkgfiles/aginx-ocr";
+///
+/// 引擎家瞬态增补（2026-10-31 强身线）：/home/.grok 随 /home 整家
+/// 上 tar，实测 392MB 里 sessions 一项 354MB（90%）——纯工作日志，
+/// 丢之无损（引擎自会重建目录）。命脉全留：auth.json/config/
+/// memtrace（引擎积累语境）/bundled/vendor。只排铁定瞬态
+/// （sessions/logs/docs），392→38MB。.codex 25MB 整留，长出大宗
+/// 再排（asr/tts/ocr 的 STATE_MAX 先例同律）。
+const STATE_TAR_EXCLUDES: &str = "--exclude=etc/aginx/svc.d --exclude=etc/aginx/secret.policy --exclude=etc/aginx/gateway.toml --exclude=etc/aginx/groups.desc --exclude=etc/aginx/device.toml --exclude=var/lib/aginx/pkgfiles/aginx-asr --exclude=var/lib/aginx/pkgfiles/aginx-tts --exclude=var/lib/aginx/pkgfiles/aginx-ocr --exclude=home/.grok/sessions --exclude=home/.grok/logs --exclude=home/.grok/docs";
 
 /// state tar 的成员白名单（testable 单一真源）。/etc/agpkg.manifest(+.sig)
 /// 随行（#472①）：重刷否则把设备的包钉回烤机版——B 线 mirror repair 腿
@@ -955,6 +962,27 @@ mod tests {
             STATE_TAR_EXCLUDES.matches("pkgfiles").count(),
             3,
             "pkgfiles excludes must stay exactly the three model trees"
+        );
+    }
+
+    #[test]
+    fn state_tar_excludes_engine_transient_bulk() {
+        // 2026-10-31 强身线：.grok 实测 392MB，sessions 一项 354MB 纯
+        // 工作日志。只排瞬态（sessions/logs/docs）；命脉 auth/config/
+        // memtrace/bundled/vendor 留在 tar 里。绝不能整家排除——
+        // bare home/.grok exclude 会把 auth.json 一并洗掉，重刷即丢
+        // 唯一在役 grok token（单会话互踢律，丢了要重新 device-code）。
+        for transient in ["sessions", "logs", "docs"] {
+            assert!(
+                STATE_TAR_EXCLUDES.contains(&format!("--exclude=home/.grok/{transient}")),
+                "missing --exclude for .grok/{transient}"
+            );
+        }
+        assert!(
+            !STATE_TAR_EXCLUDES
+                .split_whitespace()
+                .any(|t| t == "--exclude=home/.grok"),
+            "bare home/.grok exclude would wash auth.json — transient subdirs only"
         );
     }
 
