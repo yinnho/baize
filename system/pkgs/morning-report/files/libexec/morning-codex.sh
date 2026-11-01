@@ -7,10 +7,14 @@
 # v0.1.0 (#472 运维件归包)：本件随 morning-report 包入树，cron 线随包
 # [cron] 块落位（face /var/bin/morning-report），手拷的
 # /usr/libexec/aginx/morning-codex.sh + 手写 crontab 行退役。
+# v0.1.2（2026-11-01）：顶部 mkdir -p 自愈运行时目录——出生礼 seed 树
+# 只有静态件，logs//output/ 缺席则本脚本写不了日志也核不了归档
+# （10-31+11-01 晨报两连缺席的根因之一）。
 export HOME=/home
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/var/bin
 export TZ=CST-8
 WS=/home/workflows/morning-report
+mkdir -p "$WS/logs" "$WS/output"
 TS=$(date +%Y%m%d-%H%M%S)
 LOG="$WS/logs/codex-$TS.log"
 LAST=/tmp/morning-last-$TS.txt

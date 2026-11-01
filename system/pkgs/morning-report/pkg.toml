@@ -8,15 +8,19 @@
 # files/libexec/morning-codex.sh，face /var/bin/morning-report；
 # cron 线随 [cron] 块落位（安装器改表后自动 touch 目录——busybox
 # crond mtime 律），重装原地换块不重样。
-# 运行时依赖（��� depends）：codex（/var/bin/codex，brain 真答）+
+# v0.1.2（2026-11-01）：cron 线日志改 /var/log/morning-report.log（与其余
+# cron 线同纪律——day-review/backup/auto-update 全在 /var/log；旧线 redirect
+# 进 $WS/logs/crond.log，出生礼 seed 树无 logs/ 目录时 shell 在 exec 前即
+# 失败=晨报静默缺席，10-31+11-01 两连缺席实锤）；wrapper 顶 mkdir -p 自愈。
+# 运行时依赖（runtime depends）：codex（/var/bin/codex，brain 真答）+
 # /home/workflows/morning-report（晨报官工作目录，state tar 自带）+
 # channels weixin（交付腿；不在也不炸——产物核验只看 .src.md）。
 name = "morning-report"
-version = "0.1.1"
+version = "0.1.2"
 summary = "晨报 cron 腿：08:00 拉起 codex 出晨报，核验归档后微信直推绑定会话"
 group = "agent"
-url = "https://pkgs.aginx.net/morning-report/v0.1.1/morning-report-v0.1.1-4pc.tar"
+url = "https://pkgs.aginx.net/morning-report/v0.1.2/morning-report-v0.1.2-4pc.tar"
 exec = "libexec/morning-codex.sh"
 
 [cron]
-lines = ["0 8 * * * /var/bin/morning-report >> /home/workflows/morning-report/logs/crond.log 2>&1"]
+lines = ["0 8 * * * /var/bin/morning-report >> /var/log/morning-report.log 2>&1"]
