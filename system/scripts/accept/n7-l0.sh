@@ -9,7 +9,7 @@
 # （flash-redfin.sh 默认免 capture，刷完跑 pre）。
 #
 #   pre          刷完 L0：出厂形状速检（详细形状断言在 n6 pre，这里只锁
-#                门面事实：l0 戳/svc.d=2/无 wifi.conf/var/bin 空/清单见母体）
+#                门面事实：l0 戳/svc.d=1/无 wifi.conf/var/bin 空/清单见母体）
 #   usbconf      配置后置第一腿（host 驱动 adb）：推 wifi.conf → /etc/，
 #                追加 ssh 公钥（套件自生成一次性键），可选 N7_ENV 灌注
 #                /etc/aginx/env（裸 bar 不需要——留给将来 gateway 装机日），
@@ -97,7 +97,7 @@ phase_pre() {
   drv "grep -q ' l0\$' /etc/aginx-version"
   expect_rc  "版本戳尾 l0（L0 形戳）"
   drv "ls /etc/aginx/svc.d | wc -l"
-  expect_out "镜像 svc.d 恰 2（net-watch+aginxbrowser）" '^2$'
+  expect_out "镜像 svc.d 恰 1（net-watch 独苗——引擎单元随包走）" '^1$'
   drv "test ! -e /etc/wifi.conf && test ! -e /root/.ssh/authorized_keys"
   expect_rc  "出厂无配置（wifi.conf/authorized_keys 都无——零个人信息实证）"
   drv "ls -A /var/bin 2>/dev/null | wc -l"
@@ -310,8 +310,8 @@ phase_steady() {
   # 几何持久即证）——1K-blocks 9 位以上 ≈ ≥100G。
   drv "df / | sed -n 2p"
   expect_out "root fs 已扩 ≥100G（disk-grow 首启自扩收据线）" ' [0-9]{9,} '
-  # 单元：net-watch 独苗 ready——裸形态无包单元；aginxbrowser 缺席容忍
-  # （裸上游件不装）永不 ready，不计入。
+  # 单元：net-watch 独苗 ready——裸形态无包单元（2026-11-01 起烤入
+  # aginxbrowser 缺席容忍单元退役，svc.d 只剩 net-watch；引擎=diting 包）。
   local READY_OK=0
   for i in $(seq 1 20); do
     drv "/usr/bin/aginx-svc list | grep -c ready"

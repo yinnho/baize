@@ -16,7 +16,7 @@
 22@*
 
 # —— 在役本地面（全部 127.0.0.1；面外扩=红）——
-8089@127.0.0.1   # diting/aginxbrowser 引擎面（本机 ask/archify 消费）
+8089@127.0.0.1   # diting 引擎面（本机 ask/archify 消费）
 8686@127.0.0.1   # gateway prompt face raw TCP JSONL（本机 ACP）
 8800@127.0.0.1   # stunnel 代理腿 aginx-proxy（包自表化挂账）
 

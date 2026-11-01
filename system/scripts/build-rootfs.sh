@@ -585,13 +585,15 @@ done
 "${ROOT}/scripts/build-resize2fs.sh" >/dev/null
 install -m 755 "${ROOT}/out/resize2fs" "${TREE}/usr/bin/resize2fs"
 # ---- L0 清单组装（刀4；只改 TREE 副本，配方不动）--------------------------
-# 镜像 svc.d 必须恰好 2 单元（net-watch + aginxbrowser——后者是缺席容忍
-# 单元：裸上游二进制无配方可装，30s 自拾取先例，不能删）。母体/UI/网关/
-# 密钥/语音的单元全在包里带 [service]——svc.d 多出来=有人把引擎单元烤回
-# 镜像，die。
+# 镜像 svc.d 必须恰好 1 单元（net-watch 独苗）。原第二位 aginxbrowser
+# 是缺席容忍单元（裸上游二进制无配方可装，30s 自拾取）——2026-11-01
+# 退役：引擎座位=diting 包（自带 [service] 单元），烤入单元成监控残影
+# （svc list 永远多一行 absent、晨报 9/10 缺件误报）。母体/UI/网关/
+# 密钥/语音/引擎的单元全在包里带 [service]——svc.d 多出来=有人把引擎
+# 单元烤回镜像，die。
 L0_SVC_COUNT="$(ls "${TREE}/etc/aginx/svc.d/" | wc -l | tr -d ' ')"
-[ "${L0_SVC_COUNT}" = "2" ] \
-  || { echo "FATAL: L0 svc.d has ${L0_SVC_COUNT} units (want 2: net-watch + aginxbrowser) — engine units ride packages, not the image" >&2; exit 1; }
+[ "${L0_SVC_COUNT}" = "1" ] \
+  || { echo "FATAL: L0 svc.d has ${L0_SVC_COUNT} units (want 1: net-watch only) — engine units ride packages, not the image" >&2; exit 1; }
 # 基础 manifest（全 opt 目录）+ opt 附加两层（#422 服务器叙事分层）：
 #   A 服务器/agent 节点 —— 默认宣传与文档举例用这一层
 #   B 冻结人脸（term/ocr/qr/pair）—— 仍进清单可装，零新投、不进默认故事
