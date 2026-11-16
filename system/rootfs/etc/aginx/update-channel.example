@@ -1,0 +1,5 @@
+# OS update channel (optional). Copy to /etc/aginx/update-channel to enable
+# `aginx-update check|auto`. First non-comment line = signed manifest URL
+# or absolute local path. Sibling `<path>.sig` required (ed25519).
+# Example (host your own signed OTA — never point at unsigned blobs):
+# https://pkgs.aginx.net/ota/redfin/latest/manifest.json

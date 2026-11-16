@@ -6,10 +6,19 @@
 //! alone select the OS slot — proven on device 2026-09-02 with
 //! attrs-only switches in both directions, no bootloader involvement.
 //!
+//! **升级 ≠ 重装（2026-10-31 钉死）**：日常系统升版走本工具的 `apply`。
+//! - 无 `rootfs` 的 manifest：只写 A/B 分区（boot/vendor_boot/…），**userdata
+//!   上的 /home 与业务数据原位不动**——这才是「系统升级」。
+//! - 带 `rootfs` 的 manifest：在 userdata 交换区 stage 新根 + `capture`
+//!   state tar，trampoline 换根后再 state-restore；仍不是 L0。
+//! - `devices/*/dist/flash.sh` / `GO=1` 刷 userdata 整盘 = **出厂/裸箱重装**，
+//!   禁止当升级用（会洗掉未进 state 的数据）。
+//!
 //! `capture` (standalone verb): arm the state marker from the RUNNING
-//! system. state-restore is a one-shot handshake, so a fastboot flash
-//! day (the devices/<codename>/boot/ flash script) must capture before
-//! leaving adb — bake #20 receipt 2026-09-09, see the verb below.
+//! system. Required before a *rootfs* apply (and before any intentional
+//! L0 that opts into CAPTURE=1). state-restore is a one-shot handshake;
+//! a fastboot flash day must capture before leaving adb — bake #20
+//! receipt 2026-09-09. A/B-only apply never calls capture.
 //!
 //! Rollback (all observed on device 2026-09-02): the staged slot boots
 //! with succ=0/tries=7; ABL drains one try per boot that rcS does not
@@ -59,7 +68,11 @@
 //! three spawn paths are now consts below, pinned by test.
 //!
 //! Lifecycle-dispatch (omacom borrow, 2026-10-31): verbs are a fixed set
-//! (`status|apply|capture|write-part|sha256` — anything else exits 2).
+//! (`status|apply|capture|write-part|sha256|check|idle|auto` — anything else exits 2).
+//! Auto-update (2026-10-31): `check` reads `/etc/aginx/update-channel`
+//! (URL or local path to signed manifest); compares to applied version;
+//! writes pending marker when different. `auto` (cron) applies only when
+//! idle — never L0/flash. No channel configured ⇒ check/auto no-op exit 0.
 //! `write-part` only accepts the fixed by-name leaf set below (no raw
 //! `/dev/sdX`, no path escape); helper bins must be regular files at the
 //! pinned paths (symlink refuse). Platform differences stay in
@@ -116,6 +129,26 @@ struct Manifest {
 const DOWNLOAD_BIN: &str = "/usr/bin/aginx-download";
 const BOOT_OK_BIN: &str = "/usr/bin/aginx-boot-ok";
 const REBOOT_BIN: &str = "/usr/bin/aginx-reboot";
+
+/// Channel file: first non-comment, non-empty line = signed manifest URL or path.
+const CHANNEL_FILE: &str = "/etc/aginx/update-channel";
+/// Last successfully *applied* manifest.version (A/B-only does not rewrite /etc/aginx-version).
+const APPLIED_VERSION_FILE: &str = "/var/lib/aginx/update/applied-version";
+const PENDING_FILE: &str = "/var/lib/aginx/update/pending";
+const UPDATE_STATE_DIR: &str = "/var/lib/aginx/update";
+/// Gateway spools: any regular file here means an in-flight task (busy).
+const SPOOL_DIRS: &[&str] = &[
+    "/var/lib/aginx/gateway/spool",
+    "/var/lib/aginx/gateway-local/spool",
+];
+/// Process cmdline substrings that mean "有任务" (busybox /proc scan).
+const BUSY_CMDLINE_NEEDLES: &[&str] = &[
+    "morning-report",
+    "day-review.sh",
+    "/var/bin/baize night",
+    "baize night",
+    "aginx-update apply",
+];
 
 /// Fixed by-name leafs `write-part` may touch (A/B slot faces only).
 /// Adding one is a change to this crate — same law as omacom lifecycle-dispatch.
@@ -215,7 +248,7 @@ const SWAP_MAGIC: &[u8; 8] = b"AGXROOT1";
 // re-provisions them.
 const STATE_OFF: u64 = 64 << 30;
 const STATE_MAGIC: &[u8; 8] = b"AGXSTATE";
-const STATE_MAX: u64 = 512 << 20;
+const STATE_MAX: u64 = 2 << 30; // 2 GiB — was 512 MiB; research/engines blew the old ceiling (2026-10-31)
 
 /// state tar 的 --exclude 集：state-restore 是整包 `tar -xf -C /`（overlay
 /// 语义——老成员盖掉新镜像同名件，镜像新增件幸存）。/etc/aginx 里 image-owned
@@ -232,13 +265,17 @@ const STATE_MAX: u64 = 512 << 20;
 /// 重下物不进 state tar（与 /var/bin 同律：换像后 resync 判 missing 自动
 /// 补拉）。/var/models 的 symlink 让位 ensure 归 provision（每靴）。
 ///
+/// D16（2026-10-31）：/home/research 与 /home/ops 是大宗研究/运维库（数 GiB），
+/// 不进一次性 AGXSTATE——A/B 升版本就不碰 userdata；换根前应另路导出
+/// （host `.local/`），勿挤进 marker 把升级逼成 L0。身份/知识/通道仍在 /home。
+///
 /// 引擎家瞬态增补（2026-10-31 强身线）：/home/.grok 随 /home 整家
 /// 上 tar，实测 392MB 里 sessions 一项 354MB（90%）——纯工作日志，
 /// 丢之无损（引擎自会重建目录）。命脉全留：auth.json/config/
 /// memtrace（引擎积累语境）/bundled/vendor。只排铁定瞬态
 /// （sessions/logs/docs），392→38MB。.codex 25MB 整留，长出大宗
 /// 再排（asr/tts/ocr 的 STATE_MAX 先例同律）。
-const STATE_TAR_EXCLUDES: &str = "--exclude=etc/aginx/svc.d --exclude=etc/aginx/secret.policy --exclude=etc/aginx/gateway.toml --exclude=etc/aginx/groups.desc --exclude=etc/aginx/device.toml --exclude=var/lib/aginx/pkgfiles/aginx-asr --exclude=var/lib/aginx/pkgfiles/aginx-tts --exclude=var/lib/aginx/pkgfiles/aginx-ocr --exclude=home/.grok/sessions --exclude=home/.grok/logs --exclude=home/.grok/docs";
+const STATE_TAR_EXCLUDES: &str = "--exclude=etc/aginx/svc.d --exclude=etc/aginx/secret.policy --exclude=etc/aginx/gateway.toml --exclude=etc/aginx/groups.desc --exclude=etc/aginx/device.toml --exclude=var/lib/aginx/pkgfiles/aginx-asr --exclude=var/lib/aginx/pkgfiles/aginx-tts --exclude=var/lib/aginx/pkgfiles/aginx-ocr --exclude=home/research --exclude=home/ops --exclude=home/.grok/sessions --exclude=home/.grok/logs --exclude=home/.grok/docs";
 
 /// state tar 的成员白名单（testable 单一真源）。/etc/agpkg.manifest(+.sig)
 /// 随行（#472①）：重刷否则把设备的包钉回烤机版——B 线 mirror repair 腿
@@ -661,6 +698,230 @@ fn device_matches(m: &Manifest, me: &str) -> Result<(), String> {
     }
 }
 
+
+/// Applied version for channel compare: prefer last successful apply stamp,
+/// else the image's `/etc/aginx-version` (A/B-only never rewrites that file).
+fn applied_version() -> String {
+    match std::fs::read_to_string(APPLIED_VERSION_FILE) {
+        Ok(s) => {
+            let t = s.trim().to_string();
+            if t.is_empty() {
+                current_version()
+            } else {
+                t
+            }
+        }
+        Err(_) => current_version(),
+    }
+}
+
+fn record_applied_version(ver: &str) {
+    let _ = std::fs::create_dir_all(UPDATE_STATE_DIR);
+    let tmp = format!("{UPDATE_STATE_DIR}/applied-version.tmp");
+    if std::fs::write(&tmp, format!("{ver}\n")).is_ok() {
+        let _ = std::fs::rename(&tmp, APPLIED_VERSION_FILE);
+    }
+}
+
+/// First non-comment, non-empty line of the channel file.
+fn read_channel_src(channel_path: &str) -> Option<String> {
+    let body = std::fs::read_to_string(channel_path).ok()?;
+    for line in body.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        return Some(t.to_string());
+    }
+    None
+}
+
+/// True when channel version differs from applied — any string inequality
+/// is an update (no semver; the signed channel publishes exact stamps).
+fn update_available(channel_ver: &str, applied: &str) -> bool {
+    channel_ver.trim() != applied.trim()
+}
+
+fn spool_busy_count(spool_dirs: &[&str]) -> usize {
+    let mut n = 0usize;
+    for d in spool_dirs {
+        let Ok(rd) = std::fs::read_dir(d) else { continue };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.is_file() {
+                n += 1;
+            } else if p.is_dir() {
+                if let Ok(sub) = std::fs::read_dir(&p) {
+                    n += sub.flatten().filter(|e| e.path().is_file()).count();
+                }
+            }
+        }
+    }
+    n
+}
+
+fn cmdline_busy_hits(needles: &[&str], cmdlines: &[String]) -> Vec<String> {
+    let mut hits = Vec::new();
+    for cl in cmdlines {
+        for needle in needles {
+            if cl.contains(needle) {
+                hits.push(format!("{needle} ← {cl}"));
+                break;
+            }
+        }
+    }
+    hits
+}
+
+fn read_proc_cmdlines() -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir("/proc") else { return out };
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let path = ent.path().join("cmdline");
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        if bytes.is_empty() {
+            continue;
+        }
+        let s = String::from_utf8_lossy(&bytes).replace('\0', " ");
+        let s = s.trim().to_string();
+        if !s.is_empty() {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// 空闲门：spool 无在途文件 + 无已知任务进程。忙则返回原因列表。
+fn idle_blockers() -> Vec<String> {
+    let mut reasons = Vec::new();
+    let n = spool_busy_count(SPOOL_DIRS);
+    if n > 0 {
+        reasons.push(format!("spool in-flight files: {n}"));
+    }
+    for hit in cmdline_busy_hits(BUSY_CMDLINE_NEEDLES, &read_proc_cmdlines()) {
+        // Ignore our own `aginx-update auto|idle|check` invocations.
+        if hit.contains("aginx-update auto")
+            || hit.contains("aginx-update idle")
+            || hit.contains("aginx-update check")
+        {
+            continue;
+        }
+        reasons.push(format!("process: {hit}"));
+    }
+    reasons
+}
+
+fn clear_pending() {
+    let _ = std::fs::remove_file(PENDING_FILE);
+}
+
+fn write_pending(ver: &str, src: &str) {
+    let _ = std::fs::create_dir_all(UPDATE_STATE_DIR);
+    let body = format!("version={ver}\nsrc={src}\n");
+    let tmp = format!("{UPDATE_STATE_DIR}/pending.tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, PENDING_FILE);
+    }
+}
+
+/// check: resolve channel → verify+parse → compare → pending marker.
+/// Exit 0 always for cron safety when there is nothing to do / no channel.
+/// Prints a one-line machine-readable status.
+fn cmd_check(src_arg: Option<&str>) -> i32 {
+    let src = match src_arg {
+        Some(s) => s.to_string(),
+        None => match read_channel_src(CHANNEL_FILE) {
+            Some(s) => s,
+            None => {
+                println!("aginx-update: check no-channel ({CHANNEL_FILE} missing or empty)");
+                return 0;
+            }
+        },
+    };
+    let m = fetch_manifest(&src);
+    let me = &hwd::load_or_exit().device.name;
+    device_matches(&m, me).unwrap_or_else(|e| die(&e));
+    let applied = applied_version();
+    if !update_available(&m.version, &applied) {
+        clear_pending();
+        println!(
+            "aginx-update: check up-to-date applied={} channel={}",
+            applied, m.version
+        );
+        return 0;
+    }
+    write_pending(&m.version, &src);
+    println!(
+        "aginx-update: check update-available applied={} channel={} pending={}",
+        applied, m.version, PENDING_FILE
+    );
+    0
+}
+
+fn cmd_idle() -> i32 {
+    let blockers = idle_blockers();
+    if blockers.is_empty() {
+        println!("aginx-update: idle yes");
+        0
+    } else {
+        println!("aginx-update: idle no");
+        for r in blockers {
+            println!("  - {r}");
+        }
+        10
+    }
+}
+
+/// auto: check → if pending and idle → apply (never L0). --dry-run stops before apply.
+fn cmd_auto(dry_run: bool, src_arg: Option<&str>) -> i32 {
+    let rc = cmd_check(src_arg);
+    if rc != 0 {
+        return rc;
+    }
+    let pending = match std::fs::read_to_string(PENDING_FILE) {
+        Ok(s) => s,
+        Err(_) => {
+            println!("aginx-update: auto nothing-to-apply");
+            return 0;
+        }
+    };
+    let mut ver = String::new();
+    let mut src = String::new();
+    for line in pending.lines() {
+        if let Some(v) = line.strip_prefix("version=") {
+            ver = v.to_string();
+        } else if let Some(s) = line.strip_prefix("src=") {
+            src = s.to_string();
+        }
+    }
+    if ver.is_empty() || src.is_empty() {
+        println!("aginx-update: auto pending-corrupt — clearing");
+        clear_pending();
+        return 0;
+    }
+    let blockers = idle_blockers();
+    if !blockers.is_empty() {
+        println!("aginx-update: auto skip-busy pending={ver}");
+        for r in blockers {
+            println!("  - {r}");
+        }
+        return 10;
+    }
+    if dry_run {
+        println!("aginx-update: auto dry-run would-apply version={ver} src={src}");
+        return 0;
+    }
+    println!("aginx-update: auto applying version={ver} src={src}");
+    // apply records applied-version and reboots (unless we pass --no-reboot — auto wants reboot).
+    cmd_apply(&src, false);
+    0
+}
+
 fn cmd_apply(src: &str, no_reboot: bool) {
     let m = fetch_manifest(src);
     // D14 gate before any slot work: who am I comes from the same
@@ -720,6 +981,8 @@ fn cmd_apply(src: &str, no_reboot: bool) {
     if !st.success() {
         die("aginx-boot-ok set-active failed — slots untouched, safe to retry");
     }
+    record_applied_version(&m.version);
+    clear_pending();
     println!("aginx-update: slot {tgt} staged — rebooting into update (auto-rollback after 7 unmarked boots)");
     if no_reboot {
         println!("aginx-update: --no-reboot given, not rebooting");
@@ -768,8 +1031,22 @@ fn main() {
             let n = write_part(img, &dev);
             println!("aginx-update: {n} bytes → {dev}");
         }
+        Some("check") => {
+            // Optional override: aginx-update check [manifest-url-or-path]
+            let src = args.get(1).map(String::as_str);
+            std::process::exit(cmd_check(src));
+        }
+        Some("idle") => {
+            std::process::exit(cmd_idle());
+        }
+        Some("auto") => {
+            // cron entry: check channel; apply only when idle. Never L0.
+            let dry = args.iter().any(|a| a == "--dry-run");
+            let src = args.iter().skip(1).find(|a| *a != "--dry-run").map(String::as_str);
+            std::process::exit(cmd_auto(dry, src));
+        }
         _ => {
-            eprintln!("usage: aginx-update <status|apply|capture|write-part|sha256> …");
+            eprintln!("usage: aginx-update <status|apply|capture|write-part|sha256|check|idle|auto> …");
             std::process::exit(2);
         }
     }
@@ -923,7 +1200,7 @@ mod tests {
         assert_eq!(SWAP_HDR, 4096);
         assert_eq!(BAK_OFF, 32u64 << 30);
         assert_eq!(STATE_OFF, 64u64 << 30);
-        assert_eq!(STATE_MAX, 512u64 << 20);
+        assert_eq!(STATE_MAX, 2u64 << 30);
         assert_eq!(SWAP_MAGIC, b"AGXROOT1");
         assert_eq!(STATE_MAGIC, b"AGXSTATE");
     }
@@ -984,6 +1261,20 @@ mod tests {
                 .any(|t| t == "--exclude=home/.grok"),
             "bare home/.grok exclude would wash auth.json — transient subdirs only"
         );
+    }
+
+    #[test]
+    fn state_tar_excludes_home_research_and_ops() {
+        // 2026-10-31：大宗研究/运维库不进 AGXSTATE——避免 STATE_MAX 把
+        // 换根升级逼成 L0；A/B 升版本来就不碰 /home。
+        for bulk in ["home/research", "home/ops"] {
+            assert!(
+                STATE_TAR_EXCLUDES.contains(&format!("--exclude={bulk}")),
+                "missing --exclude for {bulk}"
+            );
+        }
+        // /home 本身仍在白名单（身份/知识/通道）
+        assert!(STATE_TAR_MEMBERS.contains("/home"));
     }
 
     #[test]
@@ -1112,6 +1403,60 @@ mod tests {
         assert!(require_trusted_bin(target.to_str().unwrap()).is_ok());
         // missing ok (Command dies later)
         assert!(require_trusted_bin(dir.join("absent").to_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn update_available_is_string_inequality() {
+        assert!(!update_available("1.0", "1.0"));
+        assert!(!update_available("1.0\n", "1.0"));
+        assert!(update_available("1.1", "1.0"));
+        assert!(update_available("0.1.3-ab-smoke", "aginxos redfin e88f828 2026-10-31 l0")); // D14-exempt: real image version-string fixture (update parse test)
+    }
+
+    #[test]
+    fn read_channel_skips_comments_and_blanks() {
+        let dir = tempfile_dir();
+        let f = dir.join("channel");
+        fs::write(
+            &f,
+            "# comment\n\n  \n# another\nhttps://example/manifest.json\n# trailing\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_channel_src(f.to_str().unwrap()).as_deref(),
+            Some("https://example/manifest.json")
+        );
+        let empty = dir.join("empty");
+        fs::write(&empty, "# only comments\n\n").unwrap();
+        assert!(read_channel_src(empty.to_str().unwrap()).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spool_busy_counts_files_and_nested() {
+        let dir = tempfile_dir();
+        let spool = dir.join("spool");
+        let nested = spool.join("agent");
+        fs::create_dir_all(&nested).unwrap();
+        assert_eq!(spool_busy_count(&[spool.to_str().unwrap()]), 0);
+        fs::write(spool.join("top.json"), b"{}").unwrap();
+        assert_eq!(spool_busy_count(&[spool.to_str().unwrap()]), 1);
+        fs::write(nested.join("job.json"), b"{}").unwrap();
+        assert_eq!(spool_busy_count(&[spool.to_str().unwrap()]), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cmdline_busy_hits_needles() {
+        let lines = vec![
+            "sh /var/bin/morning-report".into(),
+            "aginx-gateway -c /etc/aginx/config.toml".into(),
+            "BAIZE_HOME=/home /var/bin/baize night".into(),
+        ];
+        let hits = cmdline_busy_hits(BUSY_CMDLINE_NEEDLES, &lines);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits.iter().any(|h| h.contains("morning-report")));
+        assert!(hits.iter().any(|h| h.contains("baize night")));
     }
 
     fn tempfile_dir() -> std::path::PathBuf {
